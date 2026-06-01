@@ -213,13 +213,19 @@ class Engine {
       previewTimer = setInterval(async () => {
         let preview = "";
         if (currentOutput) {
-          const tail = currentOutput.length > 3500
-            ? "…" + currentOutput.slice(-3500)
-            : currentOutput;
-          const cleanTail = tail.trimStart();
-          preview = `✍️ Streaming...\n🤖 ${currentModel}\n\n${cleanTail}`;
+          if (currentOutput.startsWith("📋 *Activity Log:*")) {
+            preview = `⚡ *Running Task...*\n🤖 *Model:* ${currentModel}\n⏳ *Status:* ${currentStatus}\n\n${currentOutput}`;
+          } else {
+            const tail = currentOutput.length > 3500
+              ? "…" + currentOutput.slice(-3500)
+              : currentOutput;
+            let cleanTail = tail.trimStart();
+            // Insert empty lines between consecutive "I will" statements if they are not already separated by a blank line
+            cleanTail = cleanTail.replace(/(?<!\n)\n([\s\*\->]*I will\b)/gi, "\n\n$1");
+            preview = `✍️ Streaming...\n🤖 ${currentModel}\n\n${cleanTail}`;
+          }
         } else {
-          preview = `${currentStatus}\n🤖 ${currentModel}`;
+          preview = `⏳ *Running Task...*\n🤖 *Model:* ${currentModel}\n⏳ *Status:* ${currentStatus}`;
         }
 
         if (preview && preview !== lastPreviewText) {
@@ -256,7 +262,9 @@ class Engine {
       }
 
       if (result.ok) {
-        const output = result.stdout || "(empty response)";
+        let output = result.stdout || "(empty response)";
+        // Insert empty lines between consecutive "I will" statements if they are not already separated by a blank line
+        output = output.replace(/(?<!\n)\n([\s\*\->]*I will\b)/gi, "\n\n$1");
         await platform.reply(msg.replyCtx, output);
         session.addHistory("assistant", output);
 
