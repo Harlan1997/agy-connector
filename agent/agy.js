@@ -1,14 +1,18 @@
 "use strict";
 
-const { spawn } = require("child_process");
-const { StringDecoder } = require("string_decoder");
+const fs = require("fs");
+const pty = require("node-pty");
 const { Agent } = require("../core/interfaces");
 const { createLogger } = require("../core/logger");
 
 const log = createLogger("agent");
 
+// Regex to strip ANSI escape sequences from pty output
+const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[()][A-Z0-9]|\x1b\[[\?]?[0-9;]*[a-zA-Z~$]|\r/g;
+
 /**
  * AgyAgentSession adapts the agy CLI to the Agent interface.
+ * Uses node-pty for real-time streaming output.
  * Mirrors cc-connect agent adapters (claudecode, gemini, codex).
  */
 class AgyAgentSession extends Agent {
@@ -17,9 +21,9 @@ class AgyAgentSession extends Agent {
     this.agyPath = options.agyPath || "agy";
     this.workspaceDir = options.workspaceDir || process.env.HOME;
     this.maxConcurrent = options.maxConcurrent || 1;
-    this._activeProcesses = new Map(); // sessionKey -> childProcess
+    this._activeProcesses = new Map(); // sessionKey -> pty process
     this._pendingSessions = new Set(); // Prevent race conditions
-    this._waitQueue = [];              // Event-based queue (replaces busy-wait)
+    this._waitQueue = [];              // Event-based queue
   }
 
   name() {
@@ -27,18 +31,19 @@ class AgyAgentSession extends Agent {
   }
 
   /**
-   * Run agy --print and return stdout.
-   * Maps tasks to unique session keys to protect against double prompts.
+   * Run agy --print via node-pty for real-time streaming.
+   * The pty makes agy think it's talking to a terminal, so it
+   * flushes output incrementally instead of buffering to the end.
    */
   async run(sessionKey, prompt, options = {}) {
     const timeoutMinutes = parseInt(options.timeout || "5", 10);
 
-    // Check for duplicate session (atomic with pending set)
+    // Check for duplicate session
     if (this._activeProcesses.has(sessionKey) || this._pendingSessions.has(sessionKey)) {
       throw new Error("A task is already running in this chat. Use /stop to cancel it before starting a new one.");
     }
 
-    // Wait for concurrency slot using event-based queue (NOT busy-wait)
+    // Wait for concurrency slot
     if (this._activeProcesses.size >= this.maxConcurrent) {
       await new Promise(resolve => this._waitQueue.push(resolve));
     }
@@ -52,9 +57,13 @@ class AgyAgentSession extends Agent {
 
     return new Promise((resolve) => {
       const startTime = Date.now();
+      const logFilePath = `/tmp/agy_${sessionKey}.log`;
+      try { fs.unlinkSync(logFilePath); } catch (e) {}
+
       const args = [
         "--print", prompt,
         "--print-timeout", `${timeoutMinutes}m`,
+        "--log-file", logFilePath,
       ];
 
       // Add --add-dir if workspace is set and isn't home directory
@@ -62,108 +71,133 @@ class AgyAgentSession extends Agent {
         args.unshift("--add-dir", this.workspaceDir);
       }
 
-      // Filter env to exclude sensitive vars (security fix)
+      // Filter env to exclude sensitive vars
       const childEnv = { ...process.env };
       delete childEnv.TELEGRAM_BOT_TOKEN;
+      childEnv.TERM = "xterm-256color";
 
-      const child = spawn(this.agyPath, args, {
-        cwd: this.workspaceDir,
-        stdio: ["ignore", "pipe", "pipe"],
-        env: childEnv,
-      });
+      let proc;
+      try {
+        proc = pty.spawn(this.agyPath, args, {
+          name: "xterm-color",
+          cols: 200,
+          rows: 50,
+          cwd: this.workspaceDir,
+          env: childEnv,
+        });
+      } catch (err) {
+        this._pendingSessions.delete(sessionKey);
+        resolve({
+          ok: false,
+          exitCode: -1,
+          stdout: "",
+          stderr: `failed to spawn pty: ${err.message}`,
+          durationMs: Date.now() - startTime,
+        });
+        return;
+      }
 
-      this._activeProcesses.set(sessionKey, child);
+      this._activeProcesses.set(sessionKey, proc);
       this._pendingSessions.delete(sessionKey);
 
-      let stdout = "";
-      let stderr = "";
+      let fullOutput = "";
+      let lastStatus = "⏳ Connecting & authenticating...";
 
-      // Use StringDecoder to safely handle multi-byte UTF-8 characters
-      // that may be split across Buffer chunks (e.g. Chinese, emoji)
-      const stdoutDecoder = new StringDecoder("utf8");
-      const stderrDecoder = new StringDecoder("utf8");
+      // Send initial status
+      if (typeof options.onStatus === "function") {
+        options.onStatus(lastStatus);
+      }
 
-      child.stdout.on("data", (chunk) => {
-        stdout += stdoutDecoder.write(chunk);
-        // Fire streaming callback if provided
-        if (typeof options.onData === "function") {
-          options.onData(stdout);
+      // Watch log file for intermediate status updates
+      const logTimer = setInterval(() => {
+        if (!fs.existsSync(logFilePath)) return;
+        try {
+          const content = fs.readFileSync(logFilePath, "utf8");
+          let status = lastStatus;
+
+          if (content.includes("authenticated via") || content.includes("authenticated successfully")) {
+            status = "🧠 Thinking & planning...";
+          }
+          if (content.includes("generated tool calls")) {
+            status = "🛠 Running tools to read/search files...";
+          }
+          if (content.includes("streamGenerateContent")) {
+            status = "✍️ Generating answer...";
+          }
+          if (content.includes("error executing cascade step")) {
+            status = "⚠️ Tool error encountered, retrying...";
+          }
+
+          if (status !== lastStatus) {
+            lastStatus = status;
+            log.info(`[STATUS CHANGE]: ${status}`);
+            if (typeof options.onStatus === "function") {
+              options.onStatus(status);
+            }
+          }
+        } catch (e) {
+          // ignore read errors
+        }
+      }, 1000);
+
+      // Receive streaming data from pty
+      proc.onData((data) => {
+        log.debug(`[PTY RAW DATA]: ${JSON.stringify(data)}`);
+        // Strip ANSI escape codes
+        const clean = data.replace(ANSI_RE, "");
+        if (clean) {
+          log.debug(`[PTY CLEAN DATA]: ${JSON.stringify(clean)}`);
+          fullOutput += clean;
+          // Fire streaming callback with accumulated output
+          if (typeof options.onData === "function") {
+            options.onData(fullOutput);
+          }
         }
       });
 
-      child.stderr.on("data", (chunk) => {
-        stderr += stderrDecoder.write(chunk);
-      });
-
-      child.stdout.on("end", () => { stdout += stdoutDecoder.end(); });
-      child.stderr.on("end", () => { stderr += stderrDecoder.end(); });
-
       const cleanup = () => {
+        clearInterval(logTimer);
+        try { fs.unlinkSync(logFilePath); } catch (e) {}
         this._activeProcesses.delete(sessionKey);
-        // Signal next in queue (event-based concurrency)
+        // Signal next in queue
         if (this._waitQueue.length > 0) {
           const next = this._waitQueue.shift();
           next();
         }
       };
 
-      child.on("close", (code) => {
+      proc.onExit(({ exitCode }) => {
         cleanup();
         resolve({
-          ok: code === 0,
-          exitCode: code,
-          stdout: stdout.trim(),
-          stderr: stderr.trim(),
+          ok: exitCode === 0,
+          exitCode,
+          stdout: fullOutput.trim(),
+          stderr: "",
           durationMs: Date.now() - startTime,
         });
       });
 
-      child.on("error", (err) => {
-        cleanup();
-        resolve({
-          ok: false,
-          exitCode: -1,
-          stdout: "",
-          stderr: err.message,
-          durationMs: Date.now() - startTime,
-        });
-      });
-
-      // Hard timeout: 2x the agent timeout, minimum 5 minutes
+      // Hard timeout
       const hardMs = Math.max(timeoutMinutes * 2, 5) * 60 * 1000;
       const hardTimer = setTimeout(() => {
-        if (child.exitCode === null) {
-          log.warn(`hard timeout reached for session ${sessionKey}, terminating...`);
-          child.kill("SIGTERM");
-          setTimeout(() => {
-            if (child.exitCode === null) {
-              child.kill("SIGKILL");
-            }
-          }, 5000);
-        }
+        log.warn(`hard timeout reached for session ${sessionKey}, terminating...`);
+        try { proc.kill(); } catch {}
       }, hardMs);
 
-      child.on("close", () => clearTimeout(hardTimer));
+      proc.onExit(() => clearTimeout(hardTimer));
     });
   }
 
   /**
    * Stop the active task for the given session key.
-   * Returns true if a task was active and stopped.
    */
   stop(sessionKey) {
-    const child = this._activeProcesses.get(sessionKey);
-    if (!child) return false;
+    const proc = this._activeProcesses.get(sessionKey);
+    if (!proc) return false;
 
     log.info(`stopping task for session ${sessionKey}`);
     try {
-      child.kill("SIGTERM");
-      // Fallback to SIGKILL if SIGTERM doesn't work within 3s
-      setTimeout(() => {
-        if (child.exitCode === null) {
-          child.kill("SIGKILL");
-        }
-      }, 3000);
+      proc.kill();
       return true;
     } catch (err) {
       log.error(`failed to stop task: ${err.message}`);
@@ -172,31 +206,18 @@ class AgyAgentSession extends Agent {
   }
 
   /**
-   * Stop all running tasks. Used for graceful shutdown.
-   * Mirrors cc-connect agent.Stop().
+   * Stop all running tasks.
    */
   stopAll() {
     if (this._activeProcesses.size === 0) return;
     log.info(`stopping all ${this._activeProcesses.size} active task(s)...`);
-    for (const [key, child] of this._activeProcesses) {
+    for (const [key, proc] of this._activeProcesses) {
       try {
-        child.kill("SIGTERM");
+        proc.kill();
       } catch (err) {
         log.warn(`failed to stop task ${key}: ${err.message}`);
       }
     }
-    // SIGKILL fallback after 3s
-    setTimeout(() => {
-      for (const [key, child] of this._activeProcesses) {
-        if (child.exitCode === null) {
-          try {
-            child.kill("SIGKILL");
-          } catch {
-            // ignore
-          }
-        }
-      }
-    }, 3000);
   }
 
   get runningCount() {

@@ -201,34 +201,45 @@ class Engine {
     let previewTimer = null;
     let lastPreviewText = "";
     let currentOutput = "";
+    let currentStatus = "⏳ Connecting & authenticating...";
+    const currentModel = this._readCurrentModel();
+
+    try {
+      previewHandle = await platform.sendPreviewStart(msg.replyCtx, `${currentStatus}\n\n🤖 ${currentModel}`);
+    } catch { /* ignore */ }
+
+    // Live streaming preview: edit message every 2s with status or accumulated output
+    if (previewHandle && typeof platform.editMessage === "function") {
+      previewTimer = setInterval(async () => {
+        let preview = "";
+        if (currentOutput) {
+          const tail = currentOutput.length > 3500
+            ? "…" + currentOutput.slice(-3500)
+            : currentOutput;
+          preview = `✍️ Streaming...\n\n${tail}`;
+        } else {
+          preview = `${currentStatus}\n\n🤖 ${currentModel}`;
+        }
+
+        if (preview && preview !== lastPreviewText) {
+          await platform.editMessage(previewHandle, preview).catch(() => {});
+          lastPreviewText = preview;
+        }
+      }, 2000);
+    }
 
     try {
       const session = this.sessions.getOrCreateActive(sessionKey);
       session.addHistory("user", prompt);
 
-      // Send initial preview message
-      if (typeof platform.sendPreviewStart === "function") {
-        previewHandle = await platform.sendPreviewStart(msg.replyCtx, "⏳ Processing...");
-      }
-
-      // Start periodic preview updates (every 2s)
-      if (previewHandle && typeof platform.editMessage === "function") {
-        previewTimer = setInterval(async () => {
-          if (!currentOutput || currentOutput === lastPreviewText) return;
-          // Show last 3500 chars to fit Telegram's 4096 limit with prefix
-          const tail = currentOutput.length > 3500
-            ? "…" + currentOutput.slice(-3500)
-            : currentOutput;
-          const preview = `⏳ Processing...\n\n${tail}`;
-          await platform.editMessage(previewHandle, preview);
-          lastPreviewText = currentOutput;
-        }, 2000);
-      }
-
       const result = await this.agent.run(sessionKey, prompt, {
         timeout: this.config.agent.timeout,
         onData: (fullStdout) => {
+          log.info(`[ENGINE ONDATA] received fullStdout len: ${fullStdout.length}`);
           currentOutput = fullStdout;
+        },
+        onStatus: (status) => {
+          currentStatus = status;
         },
       });
 
@@ -236,22 +247,16 @@ class Engine {
       if (previewTimer) clearInterval(previewTimer);
       previewTimer = null;
 
+      // Delete the preview message
+      if (previewHandle) {
+        try {
+          await this.platform.bot.api.deleteMessage(previewHandle.chatId, previewHandle.messageId);
+        } catch { /* ignore */ }
+      }
+
       if (result.ok) {
         const output = result.stdout || "(empty response)";
-
-        // Edit the preview message with final result, or send new if no preview
-        if (previewHandle && typeof platform.editMessage === "function") {
-          const finalText = output.length > 4000
-            ? output.slice(0, 4000) + "\n\n…(truncated)"
-            : output;
-          const edited = await platform.editMessage(previewHandle, finalText);
-          if (!edited) {
-            await platform.reply(msg.replyCtx, output);
-          }
-        } else {
-          await platform.reply(msg.replyCtx, output);
-        }
-
+        await platform.reply(msg.replyCtx, output);
         session.addHistory("assistant", output);
 
         // Emit message.sent hook
@@ -264,22 +269,13 @@ class Engine {
       } else {
         // Silently ignore manual stop signals (null/130/-1)
         if (result.exitCode === null || result.exitCode === 130 || result.exitCode === -1) {
-          // Update preview to show stopped
-          if (previewHandle && typeof platform.editMessage === "function") {
-            await platform.editMessage(previewHandle, "🛑 Task stopped.");
-          }
           return;
         }
 
         const errorMsg = result.stderr
-          ? `❌ *Error (exit ${result.exitCode}):*\n\`\`\`\n${result.stderr.slice(0, 500)}\n\`\`\``
-          : `❌ *Error (exit ${result.exitCode}):* \`agy\` returned empty output`;
-
-        if (previewHandle && typeof platform.editMessage === "function") {
-          await platform.editMessage(previewHandle, errorMsg);
-        } else {
-          await platform.reply(msg.replyCtx, errorMsg);
-        }
+          ? `❌ Error (exit ${result.exitCode}):\n${result.stderr.slice(0, 500)}`
+          : `❌ Error (exit ${result.exitCode}): agy returned empty output`;
+        await platform.reply(msg.replyCtx, errorMsg);
 
         // Emit error hook
         this.hooks.emit({
@@ -293,11 +289,13 @@ class Engine {
       log.info(`done`, `session=${sessionKey}`, `duration=${(result.durationMs / 1000).toFixed(1)}s`, `exit=${result.exitCode}`);
 
     } catch (err) {
-      if (previewHandle && typeof platform.editMessage === "function") {
-        await platform.editMessage(previewHandle, `⚠️ Execution failed:\n${err.message}`);
-      } else {
-        await platform.reply(msg.replyCtx, `⚠️ *Execution failed:*\n${err.message}`);
+      if (previewTimer) clearInterval(previewTimer);
+      if (previewHandle) {
+        try {
+          await this.platform.bot.api.deleteMessage(previewHandle.chatId, previewHandle.messageId);
+        } catch { /* ignore */ }
       }
+      await platform.reply(msg.replyCtx, `⚠️ Execution failed:\n${err.message}`);
       log.error(`execution error`, `session=${sessionKey}`, `error=${err.message}`);
 
       this.hooks.emit({
@@ -307,7 +305,6 @@ class Engine {
         error: err.message,
       });
     } finally {
-      // Always clear timers
       clearInterval(typingTimer);
       if (previewTimer) clearInterval(previewTimer);
     }
