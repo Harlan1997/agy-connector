@@ -205,7 +205,7 @@ class Engine {
     const currentModel = this._readCurrentModel();
 
     try {
-      previewHandle = await platform.sendPreviewStart(msg.replyCtx, `${currentStatus}\n\n🤖 ${currentModel}`);
+      previewHandle = await platform.sendPreviewStart(msg.replyCtx, `${currentStatus}\n🤖 ${currentModel}`);
     } catch { /* ignore */ }
 
     // Live streaming preview: edit message every 2s with status or accumulated output
@@ -216,9 +216,10 @@ class Engine {
           const tail = currentOutput.length > 3500
             ? "…" + currentOutput.slice(-3500)
             : currentOutput;
-          preview = `✍️ Streaming...\n\n${tail}`;
+          const cleanTail = tail.trimStart();
+          preview = `✍️ Streaming...\n🤖 ${currentModel}\n\n${cleanTail}`;
         } else {
-          preview = `${currentStatus}\n\n🤖 ${currentModel}`;
+          preview = `${currentStatus}\n🤖 ${currentModel}`;
         }
 
         if (preview && preview !== lastPreviewText) {
