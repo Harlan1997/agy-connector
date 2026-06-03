@@ -4,7 +4,7 @@ const fs = require("fs");
 const path = require("path");
 const { execSync } = require("child_process");
 const { createLogger } = require("./logger");
-const { formatDuration, redactToken, getSessionKey } = require("./utils");
+const { formatDuration, redactToken, getSessionKey, stripMarkdown } = require("./utils");
 const { HookEvents } = require("./hooks");
 
 const log = createLogger("engine");
@@ -96,12 +96,14 @@ class Engine {
     ];
     await this.platform.registerCommands(menuCommands);
 
-    // Register inline keyboard callback handler for model selection
+    // Register inline keyboard callback handler for model selection and session management
     if (typeof this.platform.onCallbackQuery === "function") {
       this.platform.onCallbackQuery(async (ctx) => {
         const data = ctx.callbackQuery?.data || "";
         if (data.startsWith("model:")) {
           await this._handleModelCallback(ctx, data);
+        } else if (data.startsWith("session:")) {
+          await this._handleSessionCallback(ctx, data);
         }
       });
     }
@@ -254,10 +256,20 @@ class Engine {
       if (previewTimer) clearInterval(previewTimer);
       previewTimer = null;
 
-      // Delete the preview message
+      // Update the preview message instead of deleting it
       if (previewHandle) {
         try {
-          await this.platform.bot.api.deleteMessage(previewHandle.chatId, previewHandle.messageId);
+          let finalPreview = "";
+          if (currentOutput) {
+            if (currentOutput.startsWith("📋 *Activity Log:*")) {
+              finalPreview = `✅ *Task Finished!*\n🤖 *Model:* ${currentModel}\n⏳ *Status:* Done\n\n${currentOutput}`;
+            } else {
+              finalPreview = `✅ *Task Finished!*\n🤖 *Model:* ${currentModel}\n⏳ *Status:* Done\n\n${currentOutput}`;
+            }
+          } else {
+            finalPreview = `✅ *Task Finished!*\n🤖 *Model:* ${currentModel}\n⏳ *Status:* Done`;
+          }
+          await this.platform.editMessage(previewHandle, finalPreview);
         } catch { /* ignore */ }
       }
 
@@ -278,6 +290,11 @@ class Engine {
       } else {
         // Silently ignore manual stop signals (null/130/-1)
         if (result.exitCode === null || result.exitCode === 130 || result.exitCode === -1) {
+          if (previewHandle) {
+            try {
+              await this.platform.editMessage(previewHandle, `🛑 *Task Stopped.*\n🤖 *Model:* ${currentModel}`);
+            } catch { /* ignore */ }
+          }
           return;
         }
 
@@ -285,6 +302,12 @@ class Engine {
           ? `❌ Error (exit ${result.exitCode}):\n${result.stderr.slice(0, 500)}`
           : `❌ Error (exit ${result.exitCode}): agy returned empty output`;
         await platform.reply(msg.replyCtx, errorMsg);
+
+        if (previewHandle) {
+          try {
+            await this.platform.editMessage(previewHandle, `❌ *Task Failed (exit ${result.exitCode})!*\n🤖 *Model:* ${currentModel}\n\n${currentOutput || ""}`);
+          } catch { /* ignore */ }
+        }
 
         // Emit error hook
         this.hooks.emit({
@@ -301,7 +324,7 @@ class Engine {
       if (previewTimer) clearInterval(previewTimer);
       if (previewHandle) {
         try {
-          await this.platform.bot.api.deleteMessage(previewHandle.chatId, previewHandle.messageId);
+          await this.platform.editMessage(previewHandle, `❌ *Task Failed!*\n🤖 *Model:* ${currentModel}\n⚠️ *Error:* ${err.message}`);
         } catch { /* ignore */ }
       }
       await platform.reply(msg.replyCtx, `⚠️ Execution failed:\n${err.message}`);
@@ -372,13 +395,29 @@ class Engine {
           await platform.reply(msg.replyCtx, "📋 *No sessions found.*");
           return true;
         }
-        const lines = sessions.map((s, i) => {
-          const active = s.isActive ? " ← active" : "";
-          const name = s.name ? ` (${s.name})` : "";
-          const history = s.historyLen > 0 ? `, ${s.historyLen} msgs` : "";
-          return `${i + 1}. \`${s.id}\`${name}${history}${active}`;
-        });
-        await platform.reply(msg.replyCtx, `📋 *Sessions:*\n\n${lines.join("\n")}\n\nUse /switch <id> to switch sessions.`);
+
+        if (typeof platform.replyWithInlineKeyboard === "function") {
+          const buttons = sessions.map(s => {
+            const label = `${s.isActive ? "🟢" : "⚪️"} ${s.name || s.id.slice(0, 8)} (${s.historyLen} msgs)`;
+            return [
+              { text: label, data: `session:switch:${s.id}` },
+              { text: "🗑 Delete", data: `session:delete:${s.id}` }
+            ];
+          });
+          await platform.replyWithInlineKeyboard(
+            msg.replyCtx,
+            "📋 *Conversation Sessions:*\n\n🟢 Current active session\n⚪️ Click any session to switch",
+            buttons
+          );
+        } else {
+          const lines = sessions.map((s, i) => {
+            const active = s.isActive ? " ← active" : "";
+            const name = s.name ? ` (${s.name})` : "";
+            const history = s.historyLen > 0 ? `, ${s.historyLen} msgs` : "";
+            return `${i + 1}. \`${s.id}\`${name}${history}${active}`;
+          });
+          await platform.reply(msg.replyCtx, `📋 *Sessions:*\n\n${lines.join("\n")}\n\nUse /switch <id> to switch sessions.`);
+        }
         return true;
       }
 
@@ -537,17 +576,21 @@ Simply type your request or question, and the bot will execute it with the agent
         buttons.push(row);
       }
 
-      await ctx.editMessageText(
-        `🤖 *Select Model*\n\nCurrent: \`${match.name}\``,
-        {
-          parse_mode: "Markdown",
-          reply_markup: {
-            inline_keyboard: buttons.map(row =>
-              row.map(btn => ({ text: btn.text, callback_data: btn.data }))
-            ),
-          },
-        }
-      ).catch(() => {});
+      const rawText = `🤖 *Select Model*\n\nCurrent: \`${match.name}\``;
+      const editText = this.platform.plainText ? stripMarkdown(rawText) : rawText;
+
+      const editOptions = {
+        reply_markup: {
+          inline_keyboard: buttons.map(row =>
+            row.map(btn => ({ text: btn.text, callback_data: btn.data }))
+          ),
+        },
+      };
+      if (!this.platform.plainText) {
+        editOptions.parse_mode = "Markdown";
+      }
+
+      await ctx.editMessageText(editText, editOptions).catch(() => {});
 
     } catch (err) {
       log.error(`failed to switch model: ${err.message}`);
@@ -568,7 +611,7 @@ Simply type your request or question, and the bot will execute it with the agent
 
   _versionMessage() {
     return `🤖 *Agent Information*
-
+ 
 • *Agent*: \`agy\`
 • *Version*: \`${this.agyVersion}\`
 • *Path*: \`${this.config.agent.agyPath}\`
@@ -577,6 +620,78 @@ Simply type your request or question, and the bot will execute it with the agent
 • *Timeout*: \`${this.config.agent.timeout}m\`
 • *Max Concurrent*: \`${this.config.agent.maxConcurrent}\`
 `;
+  }
+
+  /**
+   * Handle session Callback Query.
+   */
+  async _handleSessionCallback(ctx, data) {
+    const chat = ctx.chat;
+    const msg = ctx.callbackQuery?.message;
+    if (!chat || !msg) return;
+
+    const chatId = String(chat.id);
+    const threadId = String(msg.message_thread_id || "");
+    const sessionKey = threadId ? `${chatId}-${threadId}` : chatId;
+
+    if (data.startsWith("session:switch:")) {
+      const targetId = data.replace("session:switch:", "");
+      const switched = this.sessions.switchSession(sessionKey, targetId);
+      if (switched) {
+        const name = switched.name ? ` (${switched.name})` : "";
+        await ctx.answerCallbackQuery({ text: `Switched to ${switched.id.slice(0, 8)}${name}` }).catch(() => {});
+        await this._updateSessionListMessage(ctx, sessionKey);
+      } else {
+        await ctx.answerCallbackQuery({ text: "⚠️ Session not found." }).catch(() => {});
+      }
+    } else if (data.startsWith("session:delete:")) {
+      const targetId = data.replace("session:delete:", "");
+      const deleted = this.sessions.deleteSession(sessionKey, targetId);
+      if (deleted) {
+        await ctx.answerCallbackQuery({ text: `Deleted session ${targetId.slice(0, 8)}` }).catch(() => {});
+        await this._updateSessionListMessage(ctx, sessionKey);
+      } else {
+        await ctx.answerCallbackQuery({ text: "⚠️ Session not found." }).catch(() => {});
+      }
+    }
+  }
+
+  /**
+   * Update the session list message in-place.
+   */
+  async _updateSessionListMessage(ctx, sessionKey) {
+    const sessions = this.sessions.listSessions(sessionKey);
+    if (sessions.length === 0) {
+      const text = this.platform.plainText ? stripMarkdown("📋 *No sessions found.*") : "📋 *No sessions found.*";
+      const options = {};
+      if (!this.platform.plainText) {
+        options.parse_mode = "Markdown";
+      }
+      await ctx.editMessageText(text, options).catch(() => {});
+      return;
+    }
+
+    const buttons = sessions.map(s => {
+      const label = `${s.isActive ? "🟢" : "⚪️"} ${s.name || s.id.slice(0, 8)} (${s.historyLen} msgs)`;
+      return [
+        { text: label, callback_data: `session:switch:${s.id}` },
+        { text: "🗑 Delete", callback_data: `session:delete:${s.id}` }
+      ];
+    });
+
+    const rawText = "📋 *Conversation Sessions:*\n\n🟢 Current active session\n⚪️ Click any session to switch";
+    const editText = this.platform.plainText ? stripMarkdown(rawText) : rawText;
+
+    const editOptions = {
+      reply_markup: {
+        inline_keyboard: buttons,
+      },
+    };
+    if (!this.platform.plainText) {
+      editOptions.parse_mode = "Markdown";
+    }
+
+    await ctx.editMessageText(editText, editOptions).catch(() => {});
   }
 }
 

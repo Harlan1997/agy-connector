@@ -3,7 +3,7 @@
 const { Bot } = require("grammy");
 const { Platform, Message } = require("../core/interfaces");
 const { createLogger } = require("../core/logger");
-const { splitMessage, getSessionKey } = require("../core/utils");
+const { splitMessage, getSessionKey, stripMarkdown, safeMarkdown } = require("../core/utils");
 
 const log = createLogger("telegram");
 
@@ -16,6 +16,7 @@ class TelegramPlatform extends Platform {
     super();
     this.token = config.token;
     this.allowedUserIds = new Set(config.allowedUserIds || []);
+    this.plainText = config.plainText || false;
     this.bot = null;
     this._handler = null;
   }
@@ -103,20 +104,24 @@ class TelegramPlatform extends Platform {
    */
   async replyWithInlineKeyboard(replyCtx, text, buttons) {
     if (!replyCtx) return;
+    const cleanText = this.plainText ? stripMarkdown(text) : safeMarkdown(text);
     try {
-      await replyCtx.reply(text, {
-        parse_mode: "Markdown",
+      const options = {
         reply_markup: {
           inline_keyboard: buttons.map(row =>
             row.map(btn => ({ text: btn.text, callback_data: btn.data }))
           ),
         },
         link_preview_options: { is_disabled: true },
-      });
+      };
+      if (!this.plainText) {
+        options.parse_mode = "Markdown";
+      }
+      await replyCtx.reply(cleanText, options);
     } catch {
       // Fallback to plain text
       try {
-        await replyCtx.reply(text, {
+        await replyCtx.reply(cleanText, {
           reply_markup: {
             inline_keyboard: buttons.map(row =>
               row.map(btn => ({ text: btn.text, callback_data: btn.data }))
@@ -139,13 +144,17 @@ class TelegramPlatform extends Platform {
 
   async reply(replyCtx, text) {
     if (!replyCtx) return;
-    const parts = splitMessage(text, 4000);
+    const cleanText = this.plainText ? stripMarkdown(text) : safeMarkdown(text);
+    const parts = splitMessage(cleanText, 4000);
     for (const part of parts) {
       try {
-        await replyCtx.reply(part, {
-          parse_mode: "Markdown",
+        const options = {
           link_preview_options: { is_disabled: true },
-        });
+        };
+        if (!this.plainText) {
+          options.parse_mode = "Markdown";
+        }
+        await replyCtx.reply(part, options);
       } catch {
         // Fallback to plain text if Markdown parsing fails
         try {
@@ -171,8 +180,9 @@ class TelegramPlatform extends Platform {
    */
   async sendPreviewStart(replyCtx, text) {
     if (!replyCtx) return null;
+    const cleanText = this.plainText ? stripMarkdown(text) : safeMarkdown(text);
     try {
-      const sent = await replyCtx.reply(text, {
+      const sent = await replyCtx.reply(cleanText, {
         link_preview_options: { is_disabled: true },
       });
       return { chatId: sent.chat.id, messageId: sent.message_id };
@@ -191,10 +201,15 @@ class TelegramPlatform extends Platform {
    */
   async editMessage(handle, text) {
     if (!handle || !this.bot) return false;
+    const cleanText = this.plainText ? stripMarkdown(text) : safeMarkdown(text);
     try {
-      await this.bot.api.editMessageText(handle.chatId, handle.messageId, text, {
+      const options = {
         link_preview_options: { is_disabled: true },
-      });
+      };
+      if (!this.plainText) {
+        options.parse_mode = "Markdown";
+      }
+      await this.bot.api.editMessageText(handle.chatId, handle.messageId, cleanText, options);
       return true;
     } catch (err) {
       // "message is not modified" is expected when content hasn't changed

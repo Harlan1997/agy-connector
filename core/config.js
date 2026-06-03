@@ -29,6 +29,7 @@ function loadConfig() {
         .split(",")
         .map(s => s.trim())
         .filter(Boolean),
+      plainText: process.env.TELEGRAM_PLAIN_TEXT === "true",
     },
 
     // Agent configuration (mirrors [projects.agent])
@@ -54,7 +55,7 @@ function loadConfig() {
 
   // Log configuration summary with redacted secrets
   log.info(`project: ${config.name}`);
-  log.info(`platform: telegram (token: ${redactToken(config.telegram.token)})`);
+  log.info(`platform: telegram (token: ${redactToken(config.telegram.token)}, plainText: ${config.telegram.plainText})`);
   log.info(`agent: ${config.agent.type} (path: ${config.agent.agyPath})`);
   log.info(`workspace: ${config.agent.workspaceDir}`);
   log.info(`allowed users: ${config.telegram.allowedUserIds.join(", ") || "(all)"}`);

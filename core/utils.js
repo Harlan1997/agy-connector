@@ -63,4 +63,70 @@ function splitMessage(text, max = 4000) {
   return parts;
 }
 
-module.exports = { formatDuration, redactToken, getSessionKey, splitMessage };
+/**
+ * Strip Markdown formatting (bold, italic, inline code, headers) for plain text delivery.
+ * @param {string} text
+ * @returns {string}
+ */
+function stripMarkdown(text) {
+  if (typeof text !== "string") return "";
+  return text
+    // 1. Strip code blocks
+    .replace(/(?<!\\)```[a-zA-Z]*\n([\s\S]*?)(?<!\\)\n```/g, "$1")
+    .replace(/(?<!\\)```([\s\S]*?)(?<!\\)```/g, "$1")
+    // 2. Strip inline code
+    .replace(/(?<!\\)`([^`]+?)(?<!\\)`/g, "$1")
+    // 3. Strip bold/italic
+    .replace(/(?<!\\)\*\*([^*]+?)(?<!\\)\*\*/g, "$1")
+    .replace(/(?<!\\)\*([^*]+?)(?<!\\)\*/g, "$1")
+    .replace(/(?<!\\)__([^_]+?)(?<!\\)__/g, "$1")
+    .replace(/(?<!\\)_([^_]+?)(?<!\\)_/g, "$1")
+    // 4. Clean up escaped characters
+    .replace(/\\([*_`\\#+\-.!{}()\[\]])/g, "$1");
+}
+
+/**
+ * Ensure markdown markers (*, _, `, ```) are closed properly.
+ * Useful for streaming output where format tags might be incomplete.
+ * @param {string} text
+ * @returns {string}
+ */
+function safeMarkdown(text) {
+  if (typeof text !== "string") return "";
+
+  // Check code blocks first
+  const codeBlockMatches = text.match(/```/g) || [];
+  let processedText = text;
+  const isInsideCodeBlock = codeBlockMatches.length % 2 !== 0;
+
+  if (isInsideCodeBlock) {
+    processedText += "\n```";
+  }
+
+  // Temporarily replace code blocks to analyze inline formatting
+  const textWithoutBlocks = processedText.replace(/```[\s\S]*?```/g, "");
+
+  // Check inline code (backticks)
+  const backtickMatches = textWithoutBlocks.match(/`/g) || [];
+  if (backtickMatches.length % 2 !== 0) {
+    processedText += "`";
+  }
+
+  // Check bold (asterisks)
+  const textWithoutEscaped = textWithoutBlocks.replace(/\\\*/g, "");
+  const asteriskMatches = textWithoutEscaped.match(/\*/g) || [];
+  if (asteriskMatches.length % 2 !== 0) {
+    processedText += "*";
+  }
+
+  // Check italic (underscores)
+  const textWithoutEscapedUnderscores = textWithoutBlocks.replace(/\\_/g, "");
+  const underscoreMatches = textWithoutEscapedUnderscores.match(/_/g) || [];
+  if (underscoreMatches.length % 2 !== 0) {
+    processedText += "_";
+  }
+
+  return processedText;
+}
+
+module.exports = { formatDuration, redactToken, getSessionKey, splitMessage, stripMarkdown, safeMarkdown };
