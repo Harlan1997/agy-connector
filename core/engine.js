@@ -40,6 +40,20 @@ const builtinCommands = [
 ];
 
 /**
+ * Filter out "I will" planning statements from the text.
+ * @param {string} text
+ * @returns {string}
+ */
+function filterPlanningStatements(text) {
+  if (typeof text !== "string") return text;
+  // Remove lines starting with optional list markers and "I will" (case insensitive)
+  let cleaned = text.replace(/^[\s\*\->]*I\s+will\b[^\n]*\n?/gim, "");
+  // Collapse 3 or more consecutive newlines down to 2 newlines
+  cleaned = cleaned.replace(/\n{3,}/g, "\n\n");
+  return cleaned;
+}
+
+/**
  * Engine routes messages between a platform and an agent.
  * Mirrors cc-connect core.Engine.
  */
@@ -222,8 +236,8 @@ class Engine {
               ? "…" + currentOutput.slice(-3500)
               : currentOutput;
             let cleanTail = tail.trimStart();
-            // Insert empty lines between consecutive "I will" statements if they are not already separated by a blank line
-            cleanTail = cleanTail.replace(/(?<!\n)\n([\s\*\->]*I will\b)/gi, "\n\n$1");
+            // Filter out "I will" planning statements
+            cleanTail = filterPlanningStatements(cleanTail);
             preview = `✍️ Streaming...\n🤖 ${currentModel}\n\n${cleanTail}`;
           }
         } else {
@@ -264,7 +278,7 @@ class Engine {
             if (currentOutput.startsWith("📋 *Activity Log:*")) {
               finalPreview = `✅ *Task Finished!*\n🤖 *Model:* ${currentModel}\n⏳ *Status:* Done\n\n${currentOutput}`;
             } else {
-              finalPreview = `✅ *Task Finished!*\n🤖 *Model:* ${currentModel}\n⏳ *Status:* Done\n\n${currentOutput}`;
+              finalPreview = `✅ *Task Finished!*\n🤖 *Model:* ${currentModel}\n⏳ *Status:* Done\n\n${filterPlanningStatements(currentOutput)}`;
             }
           } else {
             finalPreview = `✅ *Task Finished!*\n🤖 *Model:* ${currentModel}\n⏳ *Status:* Done`;
@@ -275,8 +289,8 @@ class Engine {
 
       if (result.ok) {
         let output = result.stdout || "(empty response)";
-        // Insert empty lines between consecutive "I will" statements if they are not already separated by a blank line
-        output = output.replace(/(?<!\n)\n([\s\*\->]*I will\b)/gi, "\n\n$1");
+        // Filter out "I will" planning statements
+        output = filterPlanningStatements(output);
         await platform.reply(msg.replyCtx, output);
         session.addHistory("assistant", output);
 
