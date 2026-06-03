@@ -1,5 +1,6 @@
 "use strict";
 
+const fs = require("fs");
 const path = require("path");
 const { loadConfig } = require("./core/config");
 const { setLogLevel } = require("./core/logger");
@@ -22,9 +23,26 @@ registerAgent("agy", (cfg) => new AgyAgentSession(cfg));
 // ---- Create components via dependency injection ----
 const platform = new TelegramPlatform(config.telegram);
 const agent = new AgyAgentSession(config.agent);
-const sessions = new SessionManager(
-  path.join(process.env.HOME || ".", ".agy-telegram-bridge", "sessions.json")
-);
+
+// Migrate old session directory if it exists and new one does not
+const oldSessionDir = path.join(process.env.HOME || ".", ".agy-telegram-bridge");
+const newSessionDir = path.join(process.env.HOME || ".", ".antigravity-telegram");
+const oldSessionPath = path.join(oldSessionDir, "sessions.json");
+const newSessionPath = path.join(newSessionDir, "sessions.json");
+
+if (!fs.existsSync(newSessionPath) && fs.existsSync(oldSessionPath)) {
+  if (!fs.existsSync(newSessionDir)) {
+    fs.mkdirSync(newSessionDir, { recursive: true });
+  }
+  try {
+    fs.renameSync(oldSessionPath, newSessionPath);
+    try { fs.rmdirSync(oldSessionDir); } catch (e) {}
+  } catch (e) {
+    // ignore migration error and let SessionManager initialize
+  }
+}
+
+const sessions = new SessionManager(newSessionPath);
 const hooks = new HookManager();
 const rateLimiter = new RateLimiter(config.rateLimit.maxMessages, config.rateLimit.windowMs);
 

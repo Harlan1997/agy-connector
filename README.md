@@ -1,4 +1,4 @@
-# agy-telegram-bridge
+# antigravity-telegram
 
 Bridge local AI coding agents to Telegram — inspired by [cc-connect](https://github.com/chenhg5/cc-connect).
 
@@ -9,7 +9,7 @@ Routes your Telegram messages to the local `agy` CLI assistant and returns the r
 Follows cc-connect's modular adapter pattern:
 
 ```
-agy-telegram-bridge/
+antigravity-telegram/
 ├── core/                    # Core interfaces & engine
 │   ├── interfaces.js        # Platform & Agent abstract base classes
 │   ├── engine.js            # Message routing engine

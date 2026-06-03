@@ -20,7 +20,7 @@ function loadConfig() {
 
   const config = {
     // Project name (mirrors cc-connect [[projects]].name)
-    name: process.env.PROJECT_NAME || "agy-telegram-bridge",
+    name: process.env.PROJECT_NAME || "antigravity-telegram",
 
     // Platform configuration (mirrors [[projects.platforms]])
     telegram: {

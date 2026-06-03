@@ -1,5 +1,5 @@
 {
-  "name": "agy-telegram-bridge",
+  "name": "antigravity-telegram",
   "version": "2.0.0",
   "description": "Bridge local AI coding agents to Telegram — inspired by cc-connect",
   "main": "bridge.js",
