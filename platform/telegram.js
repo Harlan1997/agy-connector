@@ -71,7 +71,14 @@ class TelegramPlatform extends Platform {
       });
 
       if (this._handler) {
-        await this._handler(this, msg);
+        // Do NOT await — Grammy processes updates sequentially by default.
+        // If we await, all subsequent messages (including /stop) are blocked
+        // until the current agent task finishes. Fire-and-forget lets Grammy
+        // immediately process the next message. The engine handles concurrency
+        // via isRunning checks and message queuing.
+        this._handler(this, msg).catch(err => {
+          log.error(`handler error: ${err.message}`);
+        });
       }
     });
 
@@ -213,9 +220,25 @@ class TelegramPlatform extends Platform {
       return true;
     } catch (err) {
       // "message is not modified" is expected when content hasn't changed
-      if (!err.message?.includes("message is not modified")) {
-        log.error(`failed to edit message: ${err.message}`);
+      if (err.message?.includes("message is not modified")) {
+        return false;
       }
+      // Fallback: retry without Markdown parse_mode if parsing failed
+      if (!this.plainText && err.message?.includes("can't parse entities")) {
+        try {
+          const plain = stripMarkdown(text);
+          await this.bot.api.editMessageText(handle.chatId, handle.messageId, plain, {
+            link_preview_options: { is_disabled: true },
+          });
+          return true;
+        } catch (fallbackErr) {
+          if (!fallbackErr.message?.includes("message is not modified")) {
+            log.error(`failed to edit message (fallback): ${fallbackErr.message}`);
+          }
+          return false;
+        }
+      }
+      log.error(`failed to edit message: ${err.message}`);
       return false;
     }
   }

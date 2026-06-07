@@ -48,11 +48,20 @@ class AgyAgentSession extends Agent {
     this.maxConcurrent = options.maxConcurrent || 1;
     this._activeProcesses = new Map(); // sessionKey -> pty process
     this._pendingSessions = new Set(); // Prevent race conditions
+    this._abortedSessions = new Set(); // Sessions that were /stop'd
     this._waitQueue = [];              // Event-based queue
   }
 
   name() {
     return "agy";
+  }
+
+  /**
+   * Check if a task is currently running for the given session key.
+   * Used by the engine to decide whether to queue messages.
+   */
+  isRunning(sessionKey) {
+    return this._activeProcesses.has(sessionKey) || this._pendingSessions.has(sessionKey);
   }
 
   /**
@@ -63,9 +72,9 @@ class AgyAgentSession extends Agent {
   async run(sessionKey, prompt, options = {}) {
     const timeoutMinutes = parseInt(options.timeout || "5", 10);
 
-    // Check for duplicate session
+    // Check for duplicate session — engine should have queued, this is a safety fallback
     if (this._activeProcesses.has(sessionKey) || this._pendingSessions.has(sessionKey)) {
-      throw new Error("A task is already running in this chat. Use /stop to cancel it before starting a new one.");
+      throw new Error("SESSION_BUSY");
     }
 
     // Wait for concurrency slot
@@ -75,7 +84,7 @@ class AgyAgentSession extends Agent {
 
     // Re-check after waiting
     if (this._activeProcesses.has(sessionKey) || this._pendingSessions.has(sessionKey)) {
-      throw new Error("A task is already running in this chat. Use /stop to cancel it before starting a new one.");
+      throw new Error("SESSION_BUSY");
     }
 
     this._pendingSessions.add(sessionKey);
@@ -91,9 +100,16 @@ class AgyAgentSession extends Agent {
         "--log-file", logFilePath,
       ];
 
+      // Resume an existing agy conversation for context continuity
+      if (options.conversationId) {
+        args.unshift("--conversation", options.conversationId);
+        log.info(`resuming agy conversation: ${options.conversationId}`);
+      }
+
       // Add --add-dir if workspace is set and isn't home directory
-      if (this.workspaceDir && this.workspaceDir !== process.env.HOME) {
-        args.unshift("--add-dir", this.workspaceDir);
+      const workspaceDir = options.workspaceDir || this.workspaceDir;
+      if (workspaceDir && workspaceDir !== process.env.HOME) {
+        args.unshift("--add-dir", workspaceDir);
       }
 
       // Filter env to exclude sensitive vars
@@ -107,7 +123,7 @@ class AgyAgentSession extends Agent {
           name: "xterm-color",
           cols: 200,
           rows: 50,
-          cwd: this.workspaceDir,
+          cwd: workspaceDir,
           env: childEnv,
         });
       } catch (err) {
@@ -128,6 +144,7 @@ class AgyAgentSession extends Agent {
       let fullOutput = "";
       let lastStatus = "⏳ Connecting & authenticating...";
       let latestThinking = "";
+      let conversationIdNotified = false;
 
       // Send initial status
       if (typeof options.onStatus === "function") {
@@ -201,6 +218,14 @@ class AgyAgentSession extends Agent {
           const convMatch = content.match(/Created conversation ([a-f0-9\-]+)/) || content.match(/conversation=([a-f0-9\-]+)/);
           if (convMatch) {
             const conversationId = convMatch[1];
+
+            // Notify engine of the conversation ID (for session persistence)
+            // Only fire once per run to avoid redundant calls from polling
+            if (!conversationIdNotified && typeof options.onConversationId === "function") {
+              conversationIdNotified = true;
+              options.onConversationId(conversationId);
+            }
+
             const appDataDir = process.env.AGY_APP_DATA_DIR || path.join(process.env.HOME || "/home/admin", ".gemini", "antigravity-cli");
             const transcriptPath = path.join(appDataDir, "brain", conversationId, ".system_generated", "logs", "transcript.jsonl");
 
@@ -338,8 +363,11 @@ class AgyAgentSession extends Agent {
                   }
 
                   if (streamingDraft) {
-                    if (activityLogAndDraft) activityLogAndDraft += "\n";
-                    activityLogAndDraft += `✍️ *Drafting Response...*\n\n${streamingDraft}`;
+                    // Ensure prefix so engine recognizes this as activity log format
+                    if (!activityLogAndDraft) {
+                      activityLogAndDraft = `📋 *Activity Log:*\n`;
+                    }
+                    activityLogAndDraft += `\n✍️ *Drafting Response...*\n\n${streamingDraft}`;
                   }
 
                   if (activityLogAndDraft && activityLogAndDraft !== latestThinking) {
@@ -388,6 +416,12 @@ class AgyAgentSession extends Agent {
 
       proc.onExit(({ exitCode }) => {
         cleanup();
+        // If user explicitly /stop'd, force exit code to -1 (manual stop signal)
+        const wasAborted = this._abortedSessions.has(sessionKey);
+        if (wasAborted) {
+          this._abortedSessions.delete(sessionKey);
+          exitCode = -1;
+        }
         resolve({
           ok: exitCode === 0,
           exitCode,
@@ -415,9 +449,58 @@ class AgyAgentSession extends Agent {
     const proc = this._activeProcesses.get(sessionKey);
     if (!proc) return false;
 
-    log.info(`stopping task for session ${sessionKey}`);
+    const pid = proc.pid;
+    log.info(`stopping task for session ${sessionKey}, pid=${pid}`);
+
+    // Mark as aborted so the run() resolver knows this was user-initiated
+    this._abortedSessions.add(sessionKey);
+
     try {
-      proc.kill();
+      // Stage 1: Write Ctrl+C (ETX) to the pty — simulates keyboard interrupt
+      try {
+        proc.write("\x03");
+      } catch { /* pty might already be closed */ }
+
+      // Stage 2: Use node-pty's own kill with SIGTERM (more reliable for pty)
+      try {
+        proc.kill("SIGTERM");
+      } catch { /* ignore */ }
+
+      // Stage 3: Kill child processes of the pty process
+      try {
+        process.kill(-pid, "SIGTERM");
+      } catch {
+        try { process.kill(pid, "SIGTERM"); } catch { /* ignore */ }
+      }
+
+      // Also kill the entire child tree via pkill (catches deeply nested children)
+      try {
+        const { execSync } = require("child_process");
+        execSync(`pkill -TERM -P ${pid} 2>/dev/null || true`, { timeout: 2000 });
+      } catch { /* ignore */ }
+
+      // Stage 4: If still running after 1.5s, escalate to SIGKILL
+      setTimeout(() => {
+        if (this._activeProcesses.has(sessionKey)) {
+          log.warn(`task still running after SIGTERM, sending SIGKILL, pid=${pid}`);
+          // Kill the entire child tree first
+          try {
+            const { execSync } = require("child_process");
+            execSync(`pkill -KILL -P ${pid} 2>/dev/null || true`, { timeout: 2000 });
+          } catch { /* ignore */ }
+
+          // Kill process group
+          try {
+            process.kill(-pid, "SIGKILL");
+          } catch {
+            try { process.kill(pid, "SIGKILL"); } catch { /* ignore */ }
+          }
+
+          // Final fallback: node-pty kill
+          try { proc.kill("SIGKILL"); } catch { /* ignore */ }
+        }
+      }, 1500);
+
       return true;
     } catch (err) {
       log.error(`failed to stop task: ${err.message}`);
@@ -431,12 +514,8 @@ class AgyAgentSession extends Agent {
   stopAll() {
     if (this._activeProcesses.size === 0) return;
     log.info(`stopping all ${this._activeProcesses.size} active task(s)...`);
-    for (const [key, proc] of this._activeProcesses) {
-      try {
-        proc.kill();
-      } catch (err) {
-        log.warn(`failed to stop task ${key}: ${err.message}`);
-      }
+    for (const [key] of this._activeProcesses) {
+      this.stop(key);
     }
   }
 

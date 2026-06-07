@@ -33,6 +33,24 @@ antigravity-telegram/
 2. Install dependencies: `npm install`
 3. Start the bridge: `npm start`
 
+## Deploy (systemd)
+
+Run the bridge as a system service (no containers needed, same approach as cc-connect):
+
+```bash
+# Copy the service file
+sudo cp antigravity-telegram.service /etc/systemd/system/
+
+# Enable and start
+sudo systemctl daemon-reload
+sudo systemctl enable antigravity-telegram
+sudo systemctl start antigravity-telegram
+
+# Check status / logs
+sudo systemctl status antigravity-telegram
+journalctl -u antigravity-telegram -f
+```
+
 ## Commands
 
 | Command | Description |

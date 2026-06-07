@@ -42,7 +42,7 @@ if (!fs.existsSync(newSessionPath) && fs.existsSync(oldSessionPath)) {
   }
 }
 
-const sessions = new SessionManager(newSessionPath);
+const sessions = new SessionManager(newSessionPath, config.agent.workspaceDir);
 const hooks = new HookManager();
 const rateLimiter = new RateLimiter(config.rateLimit.maxMessages, config.rateLimit.windowMs);
 

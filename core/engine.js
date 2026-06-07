@@ -36,6 +36,7 @@ const builtinCommands = [
   { id: "list",    aliases: [],        description: "List all conversation sessions" },
   { id: "switch",  aliases: [],        description: "Switch to a different session" },
   { id: "delete",  aliases: [],        description: "Delete a conversation session" },
+  { id: "project", aliases: ["projects"], description: "Manage workspaces / projects" },
   { id: "version", aliases: [],        description: "Show version information" },
 ];
 
@@ -78,6 +79,10 @@ class Engine {
     this.agyVersion = "Unknown";
     this._stopping = false;
 
+    // Message queue for busy sessions (mirrors cc-connect pendingMessages)
+    this._messageQueues = new Map();  // sessionKey -> queuedMessage[]
+    this._maxQueuedMessages = 5;      // max queued messages per session
+
     // Resolve agent version at startup
     try {
       this.agyVersion = execSync(
@@ -103,6 +108,7 @@ class Engine {
       { command: "start",   description: "Show available commands and usage" },
       { command: "new",     description: "Start a new conversation session" },
       { command: "list",    description: "List all conversation sessions" },
+      { command: "project", description: "Manage workspaces / projects" },
       { command: "status",  description: "Check bridge and agent status" },
       { command: "stop",    description: "Stop the currently running task" },
       { command: "model",   description: "Select AI model" },
@@ -118,6 +124,8 @@ class Engine {
           await this._handleModelCallback(ctx, data);
         } else if (data.startsWith("session:")) {
           await this._handleSessionCallback(ctx, data);
+        } else if (data.startsWith("project:")) {
+          await this._handleProjectCallback(ctx, data);
         }
       });
     }
@@ -186,10 +194,14 @@ class Engine {
       return;
     }
 
-    // Route slash commands
+    // Route slash commands BEFORE the busy-session check.
+    // This is critical: control commands like /stop MUST be processed immediately
+    // even when a task is running, otherwise they get queued and never execute.
     if (prompt.startsWith("/")) {
       const parts = prompt.split(/\s+/);
-      const command = parts[0].toLowerCase().replace(/^\//, "");
+      // Strip leading "/" and trailing "@botusername" suffix
+      // (Telegram may send /stop@mybot in groups or from command menu)
+      const command = parts[0].toLowerCase().replace(/^\//, "").replace(/@.*$/, "");
       const args = parts.slice(1);
 
       const handled = await this._handleCommand(platform, msg, sessionKey, command, args);
@@ -199,6 +211,13 @@ class Engine {
     }
 
     // Route normal prompts to the agent
+    // Check if session is busy — queue the message instead of rejecting
+    // (mirrors cc-connect queueMessageForBusySession)
+    if (this.agent.isRunning(sessionKey)) {
+      this._queueMessage(platform, msg, sessionKey, prompt);
+      return;
+    }
+
     log.info(`processing message`, `session=${sessionKey}`, `user=${msg.username}`, `len=${prompt.length}`);
 
     // Emit session started hook
@@ -254,9 +273,19 @@ class Engine {
     try {
       const session = this.sessions.getOrCreateActive(sessionKey);
       session.addHistory("user", prompt);
+      const activeProject = this.sessions.getOrCreateActiveProject(sessionKey);
 
       const result = await this.agent.run(sessionKey, prompt, {
         timeout: this.config.agent.timeout,
+        workspaceDir: activeProject.path,
+        conversationId: session.conversationId || "",
+        onConversationId: (convId) => {
+          if (convId && convId !== session.conversationId) {
+            session.conversationId = convId;
+            this.sessions._save();
+            log.info(`saved agy conversationId=${convId} to session=${session.id}`);
+          }
+        },
         onData: (fullStdout) => {
           log.info(`[ENGINE ONDATA] received fullStdout len: ${fullStdout.length}`);
           currentOutput = fullStdout;
@@ -270,17 +299,35 @@ class Engine {
       if (previewTimer) clearInterval(previewTimer);
       previewTimer = null;
 
+      // Track whether the final response was already shown in the preview
+      let responseSentViaPreview = false;
+
       // Update the preview message instead of deleting it
       if (previewHandle) {
         try {
           let finalPreview = "";
-          if (currentOutput) {
-            if (currentOutput.startsWith("📋 *Activity Log:*")) {
-              finalPreview = `✅ *Task Finished!*\n🤖 *Model:* ${currentModel}\n⏳ *Status:* Done\n\n${currentOutput}`;
+          if (currentOutput && currentOutput.startsWith("📋 *Activity Log:*")) {
+            // Strip the "Drafting Response" section from activity log,
+            // then append the final PTY output as the definitive response.
+            let cleanedLog = currentOutput;
+            const draftMarker = "\n✍️ *Drafting Response...*";
+            const draftIdx = cleanedLog.indexOf(draftMarker);
+            if (draftIdx !== -1) {
+              cleanedLog = cleanedLog.slice(0, draftIdx).trimEnd();
+            }
+
+            if (result.ok) {
+              let output = result.stdout || "(empty response)";
+              output = filterPlanningStatements(output);
+              finalPreview = `✅ *Task Finished!*\n🤖 *Model:* ${currentModel}\n\n${cleanedLog}\n\n---\n\n${output}`;
+              session.addHistory("assistant", output);
+              responseSentViaPreview = true;
             } else {
-              finalPreview = `✅ *Task Finished!*\n🤖 *Model:* ${currentModel}\n⏳ *Status:* Done\n\n${filterPlanningStatements(currentOutput)}`;
+              finalPreview = `✅ *Task Finished!*\n🤖 *Model:* ${currentModel}\n⏳ *Status:* Done\n\n${cleanedLog}`;
             }
           } else {
+            // No activity log — just show status. Response will be sent as
+            // a separate reply below.
             finalPreview = `✅ *Task Finished!*\n🤖 *Model:* ${currentModel}\n⏳ *Status:* Done`;
           }
           await this.platform.editMessage(previewHandle, finalPreview);
@@ -291,14 +338,20 @@ class Engine {
         let output = result.stdout || "(empty response)";
         // Filter out "I will" planning statements
         output = filterPlanningStatements(output);
-        await platform.reply(msg.replyCtx, output);
-        session.addHistory("assistant", output);
+
+        // Only send a separate reply if the response wasn't already
+        // included in the preview message (avoids duplicate output).
+        if (!responseSentViaPreview) {
+          await platform.reply(msg.replyCtx, output);
+          session.addHistory("assistant", output);
+        }
 
         // Emit message.sent hook
         this.hooks.emit({
           event: HookEvents.MESSAGE_SENT,
           sessionKey,
           platform: msg.platform,
+
           content: output,
         });
       } else {
@@ -336,6 +389,17 @@ class Engine {
 
     } catch (err) {
       if (previewTimer) clearInterval(previewTimer);
+
+      // Handle SESSION_BUSY — the agent was still busy (race condition fallback).
+      // Queue the message instead of showing an error.
+      if (err.message === "SESSION_BUSY") {
+        if (previewHandle) {
+          try { await this.platform.editMessage(previewHandle, `📥 *Message queued — session busy.*`); } catch { /* ignore */ }
+        }
+        this._queueMessage(platform, msg, sessionKey, prompt);
+        return;
+      }
+
       if (previewHandle) {
         try {
           await this.platform.editMessage(previewHandle, `❌ *Task Failed!*\n🤖 *Model:* ${currentModel}\n⚠️ *Error:* ${err.message}`);
@@ -353,6 +417,65 @@ class Engine {
     } finally {
       clearInterval(typingTimer);
       if (previewTimer) clearInterval(previewTimer);
+
+      // Drain queued messages after task completes (mirrors cc-connect drainPendingMessages)
+      await this._drainQueue(sessionKey);
+    }
+  }
+
+  /**
+   * Queue a message for later processing when the session is busy.
+   * Mirrors cc-connect queueMessageForBusySession.
+   * @param {import('./interfaces').Platform} platform
+   * @param {Object} msg - The incoming message object
+   * @param {string} sessionKey
+   * @param {string} prompt
+   */
+  _queueMessage(platform, msg, sessionKey, prompt) {
+    if (!this._messageQueues.has(sessionKey)) {
+      this._messageQueues.set(sessionKey, []);
+    }
+
+    const queue = this._messageQueues.get(sessionKey);
+
+    if (queue.length >= this._maxQueuedMessages) {
+      platform.reply(msg.replyCtx,
+        `⚠️ *Queue full* (${queue.length} messages pending). Please wait for the current task to finish or use /stop.`
+      );
+      return;
+    }
+
+    queue.push({ platform, msg, prompt });
+
+    log.info(`message queued`, `session=${sessionKey}`, `depth=${queue.length}`);
+    platform.reply(msg.replyCtx,
+      `📥 *Message queued* (${queue.length} in queue). Will be processed after the current task completes.`
+    );
+  }
+
+  /**
+   * Process queued messages after the current task completes.
+   * Mirrors cc-connect drainPendingMessages / drainOrphanedQueue.
+   * Takes the next message from the queue and re-dispatches it.
+   * @param {string} sessionKey
+   */
+  async _drainQueue(sessionKey) {
+    const queue = this._messageQueues.get(sessionKey);
+    if (!queue || queue.length === 0) return;
+
+    // Take the next message from the queue
+    const next = queue.shift();
+    if (queue.length === 0) {
+      this._messageQueues.delete(sessionKey);
+    }
+
+    log.info(`draining queued message`, `session=${sessionKey}`, `remaining=${queue ? queue.length : 0}`);
+
+    // Re-dispatch as if it were a fresh message
+    try {
+      await this._handleMessage(next.platform, next.msg);
+    } catch (err) {
+      log.error(`error processing queued message`, `session=${sessionKey}`, `error=${err.message}`);
     }
   }
 
@@ -368,20 +491,149 @@ class Engine {
         return true;
 
       case "status":
-        await platform.reply(msg.replyCtx, this._statusMessage());
+        await platform.reply(msg.replyCtx, this._statusMessage(sessionKey));
         return true;
 
       case "model":
         return await this._handleModelCommand(platform, msg, args);
 
       case "version":
-        await platform.reply(msg.replyCtx, this._versionMessage());
+        await platform.reply(msg.replyCtx, this._versionMessage(sessionKey));
         return true;
+
+      case "projects":
+      case "project": {
+        if (args.length === 0 || args[0].toLowerCase() === "list") {
+          const projects = this.sessions.listProjects(sessionKey);
+          if (projects.length === 0) {
+            await platform.reply(msg.replyCtx, "📂 *No workspaces found.*");
+            return true;
+          }
+
+          if (typeof platform.replyWithInlineKeyboard === "function") {
+            const buttons = projects.map(p => {
+              const label = `${p.isActive ? "🟢" : "⚪️"} ${p.name}`;
+              const row = [
+                { text: label, data: `project:switch:${p.id}` }
+              ];
+              if (p.id !== "default") {
+                row.push({ text: "🗑 Delete", data: `project:delete:${p.id}` });
+              }
+              return row;
+            });
+            await platform.replyWithInlineKeyboard(
+              msg.replyCtx,
+              "📂 *Workspaces / Projects:*\n\n🟢 Current active workspace\n⚪️ Click any workspace to switch\n\n*To create a workspace:* `/project create <path>`",
+              buttons
+            );
+          } else {
+            const lines = projects.map((p, i) => {
+              const active = p.isActive ? " ← active" : "";
+              return `${i + 1}. \`${p.name}\` (Path: \`${p.path}\`)${active}`;
+            });
+            await platform.reply(
+              msg.replyCtx,
+              `📂 *Workspaces / Projects:*\n\n${lines.join("\n")}\n\nUse \`/project switch <name>\` to switch workspace.\nUse \`/project create <path>\` to create workspace.`
+            );
+          }
+          return true;
+        }
+
+        const subCommand = args[0].toLowerCase();
+        const subArgs = args.slice(1);
+
+        if (subCommand === "create") {
+          if (subArgs.length === 0) {
+            await platform.reply(msg.replyCtx, "⚠️ *Usage:* `/project create <path>`");
+            return true;
+          }
+
+          const rawPath = subArgs.join(" ").trim();
+          const defaultWorkspaceDir = this.config.agent.workspaceDir;
+          let targetPath;
+          let resolved = rawPath;
+          if (resolved.startsWith("~/")) {
+            resolved = path.join(process.env.HOME || "/home/admin", resolved.slice(2));
+          } else if (!path.isAbsolute(resolved)) {
+            resolved = path.resolve(defaultWorkspaceDir, resolved);
+          } else {
+            resolved = path.resolve(resolved);
+          }
+          targetPath = resolved;
+
+          // Use the directory basename as the workspace name
+          const name = path.basename(targetPath);
+
+          try {
+            if (!fs.existsSync(targetPath)) {
+              fs.mkdirSync(targetPath, { recursive: true });
+            }
+            this.sessions.createProject(sessionKey, name, targetPath);
+            await platform.reply(
+              msg.replyCtx,
+              `✅ *Workspace created & activated!*\n• *Name:* \`${name}\`\n• *Path:* \`${targetPath}\``
+            );
+          } catch (err) {
+            await platform.reply(msg.replyCtx, `⚠️ *Error creating workspace:* ${err.message}`);
+          }
+          return true;
+        }
+
+        if (subCommand === "switch") {
+          if (subArgs.length === 0) {
+            await platform.reply(msg.replyCtx, "⚠️ *Usage:* `/project switch <name-or-id>`");
+            return true;
+          }
+          const target = subArgs.join(" ").trim();
+          const switched = this.sessions.switchProject(sessionKey, target);
+          if (switched) {
+            await platform.reply(
+              msg.replyCtx,
+              `🔄 *Switched to workspace:* \`${switched.name}\`\n• *Path:* \`${switched.path}\``
+            );
+          } else {
+            await platform.reply(
+              msg.replyCtx,
+              `⚠️ *Workspace not found:* \`${target}\`\nUse \`/project\` or \`/project list\` to see available workspaces.`
+            );
+          }
+          return true;
+        }
+
+        if (subCommand === "delete") {
+          if (subArgs.length === 0) {
+            await platform.reply(msg.replyCtx, "⚠️ *Usage:* `/project delete <name-or-id>`");
+            return true;
+          }
+          const target = subArgs.join(" ").trim();
+          try {
+            const deleted = this.sessions.deleteProject(sessionKey, target);
+            if (deleted) {
+              await platform.reply(msg.replyCtx, `🗑 *Workspace deleted:* \`${target}\``);
+            } else {
+              await platform.reply(msg.replyCtx, `⚠️ *Workspace not found:* \`${target}\``);
+            }
+          } catch (err) {
+            await platform.reply(msg.replyCtx, `⚠️ *Error:* ${err.message}`);
+          }
+          return true;
+        }
+
+        await platform.reply(
+          msg.replyCtx,
+          `⚠️ *Unknown subcommand:* \`${subCommand}\`\n\n*Available commands:*\n• \`/project\` or \`/project list\`\n• \`/project create <path>\`\n• \`/project switch <name>\`\n• \`/project delete <name>\``
+        );
+        return true;
+      }
 
       case "stop": {
         const stopped = this.agent.stop(sessionKey);
         if (stopped) {
-          await platform.reply(msg.replyCtx, "🛑 *Task stopped successfully.*");
+          // Clear any queued messages when user explicitly stops (mirrors cc-connect)
+          const queuedCount = (this._messageQueues.get(sessionKey) || []).length;
+          this._messageQueues.delete(sessionKey);
+          const queueMsg = queuedCount > 0 ? ` ${queuedCount} queued message(s) discarded.` : "";
+          await platform.reply(msg.replyCtx, `🛑 *Task stopped successfully.*${queueMsg}`);
           this.hooks.emit({
             event: HookEvents.SESSION_ENDED,
             sessionKey,
@@ -489,6 +741,7 @@ An elegant bridge that routes your Telegram messages to the local \`agy\` CLI as
 • /list \- List all conversation sessions
 • /switch <id> \- Switch to a different session
 • /delete <id> \- Delete a conversation session
+• /project \- Manage workspaces / projects
 • /version \- Show version information
 
 *Usage:*
@@ -496,10 +749,11 @@ Simply type your request or question, and the bot will execute it with the agent
 `;
   }
 
-  _statusMessage() {
+  _statusMessage(sessionKey) {
     const uptimeMs = Date.now() - this.startTime;
     const uptime = formatDuration(uptimeMs);
     const activeTasks = this.agent.runningCount;
+    const project = this.sessions.getOrCreateActiveProject(sessionKey);
 
     return `📊 *System Status*
 
@@ -507,7 +761,7 @@ Simply type your request or question, and the bot will execute it with the agent
 • *Uptime*: ${uptime}
 • *Active Tasks*: ${activeTasks} / ${this.config.agent.maxConcurrent}
 • *CLI Path*: \`${this.config.agent.agyPath}\`
-• *Workspace*: \`${this.config.agent.workspaceDir}\`
+• *Workspace*: \`${project.path}\` (Project: \`${project.name}\`)
 `;
   }
 
@@ -623,14 +877,15 @@ Simply type your request or question, and the bot will execute it with the agent
     }
   }
 
-  _versionMessage() {
+  _versionMessage(sessionKey) {
+    const project = this.sessions.getOrCreateActiveProject(sessionKey);
     return `🤖 *Agent Information*
  
 • *Agent*: \`agy\`
 • *Version*: \`${this.agyVersion}\`
 • *Path*: \`${this.config.agent.agyPath}\`
 • *Mode*: \`--print (non-interactive)\`
-• *Workspace*: \`${this.config.agent.workspaceDir}\`
+• *Workspace*: \`${project.path}\` (Project: \`${project.name}\`)
 • *Timeout*: \`${this.config.agent.timeout}m\`
 • *Max Concurrent*: \`${this.config.agent.maxConcurrent}\`
 `;
@@ -694,6 +949,84 @@ Simply type your request or question, and the bot will execute it with the agent
     });
 
     const rawText = "📋 *Conversation Sessions:*\n\n🟢 Current active session\n⚪️ Click any session to switch";
+    const editText = this.platform.plainText ? stripMarkdown(rawText) : rawText;
+
+    const editOptions = {
+      reply_markup: {
+        inline_keyboard: buttons,
+      },
+    };
+    if (!this.platform.plainText) {
+      editOptions.parse_mode = "Markdown";
+    }
+
+    await ctx.editMessageText(editText, editOptions).catch(() => {});
+  }
+
+  /**
+   * Handle project Callback Query.
+   */
+  async _handleProjectCallback(ctx, data) {
+    const chat = ctx.chat;
+    const msg = ctx.callbackQuery?.message;
+    if (!chat || !msg) return;
+
+    const chatId = String(chat.id);
+    const threadId = String(msg.message_thread_id || "");
+    const sessionKey = threadId ? `${chatId}-${threadId}` : chatId;
+
+    if (data.startsWith("project:switch:")) {
+      const targetId = data.replace("project:switch:", "");
+      const switched = this.sessions.switchProject(sessionKey, targetId);
+      if (switched) {
+        await ctx.answerCallbackQuery({ text: `Switched to workspace: ${switched.name}` }).catch(() => {});
+        await this._updateProjectListMessage(ctx, sessionKey);
+      } else {
+        await ctx.answerCallbackQuery({ text: "⚠️ Workspace not found." }).catch(() => {});
+      }
+    } else if (data.startsWith("project:delete:")) {
+      const targetId = data.replace("project:delete:", "");
+      try {
+        const deleted = this.sessions.deleteProject(sessionKey, targetId);
+        if (deleted) {
+          await ctx.answerCallbackQuery({ text: "Workspace deleted" }).catch(() => {});
+          await this._updateProjectListMessage(ctx, sessionKey);
+        } else {
+          await ctx.answerCallbackQuery({ text: "⚠️ Workspace not found." }).catch(() => {});
+        }
+      } catch (err) {
+        await ctx.answerCallbackQuery({ text: `⚠️ Error: ${err.message}` }).catch(() => {});
+      }
+    }
+  }
+
+  /**
+   * Update the project list message in-place.
+   */
+  async _updateProjectListMessage(ctx, sessionKey) {
+    const projects = this.sessions.listProjects(sessionKey);
+    if (projects.length === 0) {
+      const text = this.platform.plainText ? stripMarkdown("📂 *No workspaces found.*") : "📂 *No workspaces found.*";
+      const options = {};
+      if (!this.platform.plainText) {
+        options.parse_mode = "Markdown";
+      }
+      await ctx.editMessageText(text, options).catch(() => {});
+      return;
+    }
+
+    const buttons = projects.map(p => {
+      const label = `${p.isActive ? "🟢" : "⚪️"} ${p.name}`;
+      const row = [
+        { text: label, callback_data: `project:switch:${p.id}` }
+      ];
+      if (p.id !== "default") {
+        row.push({ text: "🗑 Delete", callback_data: `project:delete:${p.id}` });
+      }
+      return row;
+    });
+
+    const rawText = "📂 *Workspaces / Projects:*\n\n🟢 Current active workspace\n⚪️ Click any workspace to switch\n\n*To create a workspace:* `/project create <path>`";
     const editText = this.platform.plainText ? stripMarkdown(rawText) : rawText;
 
     const editOptions = {
