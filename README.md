@@ -1,4 +1,4 @@
-# agy-tg-connector
+# agy-connector
 
 Connect local AI coding agents to Telegram — inspired by [cc-connect](https://github.com/chenhg5/cc-connect).
 
@@ -9,7 +9,7 @@ Routes your Telegram messages to the local `agy` CLI assistant and returns the r
 Follows cc-connect's modular adapter pattern:
 
 ```
-agy-tg-connector/
+agy-connector/
 ├── core/                    # Core interfaces & engine
 │   ├── interfaces.js        # Platform & Agent abstract base classes
 │   ├── engine.js            # Message routing engine
@@ -39,16 +39,16 @@ Run the bridge as a system service (no containers needed, same approach as cc-co
 
 ```bash
 # Copy the service file
-sudo cp agy-tg-connector.service /etc/systemd/system/
+sudo cp agy-connector.service /etc/systemd/system/
 
 # Enable and start
 sudo systemctl daemon-reload
-sudo systemctl enable agy-tg-connector
-sudo systemctl start agy-tg-connector
+sudo systemctl enable agy-connector
+sudo systemctl start agy-connector
 
 # Check status / logs
-sudo systemctl status agy-tg-connector
-journalctl -u agy-tg-connector -f
+sudo systemctl status agy-connector
+journalctl -u agy-connector -f
 ```
 
 ## Commands

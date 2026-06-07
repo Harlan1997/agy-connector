@@ -26,6 +26,9 @@ Thumbs.db
 *token*
 *credential*
 
+# Systemd service files (contain machine-specific paths)
+*.service
+
 # Project specific caches and recordings
 cache/
 typescript

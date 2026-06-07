@@ -317,7 +317,7 @@ class Engine {
             }
 
             if (result.ok) {
-              let output = result.stdout || "(empty response)";
+              let output = result.finalResponse || result.stdout || "(empty response)";
               output = filterPlanningStatements(output);
               finalPreview = `✅ *Task Finished!*\n🤖 *Model:* ${currentModel}\n\n${cleanedLog}\n\n---\n\n${output}`;
               session.addHistory("assistant", output);
@@ -335,7 +335,7 @@ class Engine {
       }
 
       if (result.ok) {
-        let output = result.stdout || "(empty response)";
+        let output = result.finalResponse || result.stdout || "(empty response)";
         // Filter out "I will" planning statements
         output = filterPlanningStatements(output);
 

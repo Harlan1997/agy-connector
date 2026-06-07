@@ -1,5 +1,5 @@
 {
-  "name": "agy-tg-connector",
+  "name": "agy-connector",
   "version": "2.0.0",
   "description": "Connect local AI coding agents to Telegram — inspired by cc-connect",
   "main": "bridge.js",

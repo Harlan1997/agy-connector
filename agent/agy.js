@@ -145,7 +145,12 @@ class AgyAgentSession extends Agent {
       let lastStatus = "⏳ Connecting & authenticating...";
       let latestThinking = "";
       let conversationIdNotified = false;
-      let baselineStepCount = -1; // steps from previous turns to skip in activity log
+      let capturedConvId = options.conversationId || "";
+      // For resumed conversations: the max step_index from previous turns.
+      // Steps with step_index <= this value are old and should be hidden.
+      // -1 means "not yet determined" (set on first transcript read).
+      // 0 means "new conversation, show everything".
+      let baselineStepIndex = options.conversationId ? -1 : 0;
 
       // Send initial status
       if (typeof options.onStatus === "function") {
@@ -219,6 +224,7 @@ class AgyAgentSession extends Agent {
           const convMatch = content.match(/Created conversation ([a-f0-9\-]+)/) || content.match(/conversation=([a-f0-9\-]+)/);
           if (convMatch) {
             const conversationId = convMatch[1];
+            capturedConvId = conversationId;
 
             // Notify engine of the conversation ID (for session persistence)
             // Only fire once per run to avoid redundant calls from polling
@@ -230,23 +236,25 @@ class AgyAgentSession extends Agent {
             const appDataDir = process.env.AGY_APP_DATA_DIR || path.join(process.env.HOME || "/home/admin", ".gemini", "antigravity-cli");
             const transcriptPath = path.join(appDataDir, "brain", conversationId, ".system_generated", "logs", "transcript.jsonl");
 
-            // On first detection, record baseline step count so we only show
-            // steps from the current turn (not from previous conversation turns)
-            if (baselineStepCount < 0) {
+            // On first transcript read for a resumed conversation, record
+            // the max step_index so we can filter out old turns' steps.
+            if (baselineStepIndex < 0) {
               try {
                 const initContent = fs.readFileSync(transcriptPath, "utf8");
-                let count = 0;
+                let maxIdx = 0;
                 for (const l of initContent.split("\n")) {
                   if (!l.trim()) continue;
                   try {
                     const s = JSON.parse(l);
-                    if (s.type === "PLANNER_RESPONSE") count++;
+                    if (s.step_index != null && s.step_index > maxIdx) {
+                      maxIdx = s.step_index;
+                    }
                   } catch { /* ignore */ }
                 }
-                baselineStepCount = count;
-                log.info(`baseline step count for resumed conversation: ${baselineStepCount}`);
+                baselineStepIndex = maxIdx;
+                log.info(`baseline step_index for resumed conversation: ${baselineStepIndex}`);
               } catch {
-                baselineStepCount = 0;
+                baselineStepIndex = 0;
               }
             }
 
@@ -267,8 +275,10 @@ class AgyAgentSession extends Agent {
                   }
                 }
 
-                // Only show steps from the current turn
-                const currentSteps = baselineStepCount > 0 ? steps.slice(baselineStepCount) : steps;
+                // Only show steps from the current turn by filtering on step_index
+                const currentSteps = baselineStepIndex > 0
+                  ? steps.filter(s => (s.step_index || 0) > baselineStepIndex)
+                  : steps;
 
                 if (currentSteps.length > 0) {
                   const lastIndex = currentSteps.length - 1;
@@ -446,10 +456,51 @@ class AgyAgentSession extends Agent {
           this._abortedSessions.delete(sessionKey);
           exitCode = -1;
         }
+
+        // Extract only the current turn's final response from transcript.
+        // This avoids sending accumulated output from all previous turns
+        // which happens when agy --print --conversation resumes a conversation.
+        let finalResponse = "";
+        if (capturedConvId) {
+          try {
+            const appDataDir = process.env.AGY_APP_DATA_DIR || path.join(process.env.HOME || "/home/admin", ".gemini", "antigravity-cli");
+            const transcriptPath = path.join(appDataDir, "brain", capturedConvId, ".system_generated", "logs", "transcript.jsonl");
+            if (fs.existsSync(transcriptPath)) {
+              const tContent = fs.readFileSync(transcriptPath, "utf8");
+              const allSteps = [];
+              for (const tLine of tContent.split("\n")) {
+                if (!tLine.trim()) continue;
+                try {
+                  const s = JSON.parse(tLine);
+                  if (s.type === "PLANNER_RESPONSE") allSteps.push(s);
+                } catch { /* ignore */ }
+              }
+              // Filter to current turn only
+              const turnSteps = baselineStepIndex > 0
+                ? allSteps.filter(s => (s.step_index || 0) > baselineStepIndex)
+                : allSteps;
+              // Find the last text response (PLANNER_RESPONSE without tool_calls)
+              for (let i = turnSteps.length - 1; i >= 0; i--) {
+                const s = turnSteps[i];
+                if ((!s.tool_calls || s.tool_calls.length === 0) && s.content && s.content.trim()) {
+                  finalResponse = s.content.trim();
+                  break;
+                }
+              }
+              if (finalResponse) {
+                log.info(`extracted final response from transcript (${finalResponse.length} chars)`);
+              }
+            }
+          } catch (err) {
+            log.debug(`failed to extract final response from transcript: ${err.message}`);
+          }
+        }
+
         resolve({
           ok: exitCode === 0,
           exitCode,
           stdout: fullOutput.trim(),
+          finalResponse,
           stderr: "",
           durationMs: Date.now() - startTime,
         });
