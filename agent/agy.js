@@ -145,6 +145,7 @@ class AgyAgentSession extends Agent {
       let lastStatus = "⏳ Connecting & authenticating...";
       let latestThinking = "";
       let conversationIdNotified = false;
+      let baselineStepCount = -1; // steps from previous turns to skip in activity log
 
       // Send initial status
       if (typeof options.onStatus === "function") {
@@ -229,6 +230,26 @@ class AgyAgentSession extends Agent {
             const appDataDir = process.env.AGY_APP_DATA_DIR || path.join(process.env.HOME || "/home/admin", ".gemini", "antigravity-cli");
             const transcriptPath = path.join(appDataDir, "brain", conversationId, ".system_generated", "logs", "transcript.jsonl");
 
+            // On first detection, record baseline step count so we only show
+            // steps from the current turn (not from previous conversation turns)
+            if (baselineStepCount < 0) {
+              try {
+                const initContent = fs.readFileSync(transcriptPath, "utf8");
+                let count = 0;
+                for (const l of initContent.split("\n")) {
+                  if (!l.trim()) continue;
+                  try {
+                    const s = JSON.parse(l);
+                    if (s.type === "PLANNER_RESPONSE") count++;
+                  } catch { /* ignore */ }
+                }
+                baselineStepCount = count;
+                log.info(`baseline step count for resumed conversation: ${baselineStepCount}`);
+              } catch {
+                baselineStepCount = 0;
+              }
+            }
+
             if (fs.existsSync(transcriptPath)) {
               try {
                 const transcriptContent = fs.readFileSync(transcriptPath, "utf8");
@@ -246,16 +267,19 @@ class AgyAgentSession extends Agent {
                   }
                 }
 
-                if (steps.length > 0) {
-                  const lastIndex = steps.length - 1;
-                  const lastStep = steps[lastIndex];
+                // Only show steps from the current turn
+                const currentSteps = baselineStepCount > 0 ? steps.slice(baselineStepCount) : steps;
+
+                if (currentSteps.length > 0) {
+                  const lastIndex = currentSteps.length - 1;
+                  const lastStep = currentSteps[lastIndex];
                   const isLastStepTool = lastStep.tool_calls && lastStep.tool_calls.length > 0;
 
                   const formattedSteps = [];
-                  const limit = isLastStepTool ? steps.length : steps.length - 1;
+                  const limit = isLastStepTool ? currentSteps.length : currentSteps.length - 1;
 
                   for (let i = 0; i < limit; i++) {
-                    const step = steps[i];
+                    const step = currentSteps[i];
                     const isActive = isLastStepTool && (i === lastIndex);
                     
                     if (step.tool_calls && step.tool_calls.length > 0) {

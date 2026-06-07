@@ -1,25 +1,25 @@
 [Unit]
-Description=Antigravity Telegram Bridge
+Description=Agy TG Connector
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/home/admin/agy-telegram-bridge
+WorkingDirectory=/home/admin/agy-tg-connector
 ExecStart=/usr/bin/node bridge.js
 Restart=on-failure
 RestartSec=5
 
 # Environment
-EnvironmentFile=/home/admin/agy-telegram-bridge/.env
+EnvironmentFile=/home/admin/agy-tg-connector/.env
 Environment=NODE_ENV=production
 Environment=HOME=/home/admin
 
 # Logging
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=antigravity-telegram
+SyslogIdentifier=agy-tg-connector
 
 # Security hardening
 NoNewPrivileges=false
@@ -27,3 +27,4 @@ ProtectSystem=false
 
 [Install]
 WantedBy=multi-user.target
+

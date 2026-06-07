@@ -25,7 +25,7 @@ const platform = new TelegramPlatform(config.telegram);
 const agent = new AgyAgentSession(config.agent);
 
 // Migrate old session directory if it exists and new one does not
-const oldSessionDir = path.join(process.env.HOME || ".", ".agy-telegram-bridge");
+const oldSessionDir = path.join(process.env.HOME || ".", ".agy-tg-connector");
 const newSessionDir = path.join(process.env.HOME || ".", ".antigravity-telegram");
 const oldSessionPath = path.join(oldSessionDir, "sessions.json");
 const newSessionPath = path.join(newSessionDir, "sessions.json");
