@@ -1,12 +1,42 @@
-# agy-connector
+# 🔗 agy-connector
 
-Connect local AI coding agents to Telegram — inspired by [cc-connect](https://github.com/chenhg5/cc-connect).
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Node.js](https://img.shields.io/badge/Node.js-18+-green.svg)](https://nodejs.org/)
+[![Telegram Bot](https://img.shields.io/badge/Telegram-Bot-26A5E4.svg?logo=telegram)](https://core.telegram.org/bots)
 
-Routes your Telegram messages to the local `agy` CLI assistant and returns the results.
+**Connect your local AI coding agent to Telegram.** Chat with your AI assistant from anywhere — on the go, from your phone, or across devices.
 
-## Architecture
+> Inspired by [cc-connect](https://github.com/chenhg5/cc-connect). Lightweight, extensible, and zero-cloud — your agent runs locally, you just talk to it remotely.
 
-Follows cc-connect's modular adapter pattern:
+## ✨ Features
+
+- 📱 **Remote Access** — Talk to your local AI coding agent from anywhere via Telegram
+- 🔄 **Real-time Streaming** — See agent activity and progress as it works
+- 💬 **Multi-session** — Manage multiple conversation sessions with persistent history
+- 🔌 **Pluggable Architecture** — Adapter pattern for platforms and agents (easy to extend)
+- ⚡ **Lightweight** — Pure Node.js, no containers needed, runs as a systemd service
+- 🛡️ **Secure** — User whitelist, rate limiting, and no cloud dependencies
+- 🎯 **Session Management** — Create, switch, list, and delete conversation sessions via Telegram commands
+
+## 🏗️ Architecture
+
+```
+┌──────────┐       ┌───────────────────┐       ┌──────────────┐
+│ Telegram │◄─────►│   agy-connector   │◄─────►│  Local Agent  │
+│   App    │  Bot  │  (bridge/router)  │  PTY  │  (agy CLI)   │
+└──────────┘  API  └───────────────────┘       └──────────────┘
+                            │
+                    ┌───────┴───────┐
+                    │   Features    │
+                    ├───────────────┤
+                    │ • Sessions    │
+                    │ • Rate Limit  │
+                    │ • Hooks       │
+                    │ • Registry    │
+                    └───────────────┘
+```
+
+### Project Structure
 
 ```
 agy-connector/
@@ -21,37 +51,35 @@ agy-connector/
 │   ├── logger.js            # Structured logging
 │   └── utils.js             # Shared utilities
 ├── platform/                # Platform adapters
-│   └── telegram.js          # Telegram adapter
+│   └── telegram.js          # Telegram adapter (grammY)
 ├── agent/                   # Agent adapters
-│   └── agy.js               # Agy CLI adapter
+│   └── agy.js               # Agy CLI adapter (PTY-based)
 └── bridge.js                # Entry point (wiring)
 ```
 
-## Setup
+## 🚀 Quick Start
 
-1. Copy `.env.example` to `.env` and fill in your credentials
-2. Install dependencies: `npm install`
-3. Start the bridge: `npm start`
+### 1. Get a Telegram Bot Token
 
-## Deploy (systemd)
+Chat with [@BotFather](https://t.me/BotFather) on Telegram and create a new bot.
 
-Run the bridge as a system service (no containers needed, same approach as cc-connect):
+### 2. Configure
 
 ```bash
-# Copy the service file
-sudo cp agy-connector.service /etc/systemd/system/
-
-# Enable and start
-sudo systemctl daemon-reload
-sudo systemctl enable agy-connector
-sudo systemctl start agy-connector
-
-# Check status / logs
-sudo systemctl status agy-connector
-journalctl -u agy-connector -f
+cp .env.example .env
+# Edit .env with your bot token and settings
 ```
 
-## Commands
+### 3. Install & Run
+
+```bash
+npm install
+npm start
+```
+
+That's it! Send a message to your bot on Telegram and it will be routed to your local AI agent.
+
+## 📋 Telegram Commands
 
 | Command | Description |
 |---------|-------------|
@@ -65,18 +93,48 @@ journalctl -u agy-connector -f
 | `/delete <id>` | Delete a conversation session |
 | `/version` | Show version information |
 
-## Configuration
+## 🔧 Deploy as Service (systemd)
 
-All configuration is done via environment variables (see `.env.example`).
+Run the bridge as a persistent system service — no containers needed:
 
-## Extending
+```bash
+# Create and edit the service file for your environment
+sudo cp agy-connector.service /etc/systemd/system/
 
-The project uses cc-connect's adapter pattern. To add support for a new platform or agent:
+# Enable and start
+sudo systemctl daemon-reload
+sudo systemctl enable agy-connector
+sudo systemctl start agy-connector
+
+# Check status / logs
+sudo systemctl status agy-connector
+journalctl -u agy-connector -f
+```
+
+## ⚙️ Configuration
+
+All configuration is done via environment variables. See [`.env.example`](.env.example) for all available options:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `TELEGRAM_BOT_TOKEN` | Your Telegram bot token | (required) |
+| `ALLOWED_USER_IDS` | Comma-separated list of allowed user IDs | (all users) |
+| `AGY_PATH` | Path to the agent CLI binary | `agy` |
+| `WORKSPACE_DIR` | Working directory for the agent | `/home/user` |
+| `MAX_CONCURRENT` | Maximum concurrent agent tasks | `1` |
+| `AGENT_TIMEOUT` | Agent timeout in minutes | `10` |
+| `LOG_LEVEL` | Log level: debug, info, warn, error | `info` |
+
+## 🧩 Extending
+
+The project uses a modular adapter pattern. To add support for a new platform or agent:
 
 1. Create a new file in `platform/` or `agent/`
 2. Extend the `Platform` or `Agent` base class from `core/interfaces.js`
 3. Register it in `bridge.js` using `registerPlatform()` or `registerAgent()`
 
-## License
+For example, you could add a Discord adapter, a Slack adapter, or swap in a different AI agent backend.
 
-MIT
+## 📄 License
+
+[MIT](LICENSE)

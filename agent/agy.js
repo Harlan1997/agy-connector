@@ -430,9 +430,18 @@ class AgyAgentSession extends Agent {
         if (clean) {
           log.debug(`[PTY CLEAN DATA]: ${JSON.stringify(clean)}`);
           fullOutput += clean;
-          // Fire streaming callback with accumulated output
+          // Fire streaming callback with accumulated output.
+          // For resumed conversations, only send the transcript-based activity
+          // log (latestThinking) — NOT the raw PTY output — because agy --print
+          // replays all previous turns' text to stdout, which would show
+          // historical messages in the streaming preview.
           if (typeof options.onData === "function") {
-            options.onData(latestThinking || fullOutput);
+            if (latestThinking) {
+              options.onData(latestThinking);
+            } else if (!options.conversationId) {
+              // New conversations: safe to show raw output (no history to leak)
+              options.onData(fullOutput);
+            }
           }
         }
       });
