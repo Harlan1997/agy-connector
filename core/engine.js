@@ -2,6 +2,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
 const { execSync } = require("child_process");
 const { createLogger } = require("./logger");
 const { formatDuration, redactToken, getSessionKey, stripMarkdown } = require("./utils");
@@ -548,18 +549,21 @@ class Engine {
             return true;
           }
 
-          const rawPath = subArgs.join(" ").trim();
-          const defaultWorkspaceDir = this.config.agent.workspaceDir;
-          let targetPath;
-          let resolved = rawPath;
-          if (resolved.startsWith("~/")) {
-            resolved = path.join(process.env.HOME || "/home/admin", resolved.slice(2));
-          } else if (!path.isAbsolute(resolved)) {
-            resolved = path.resolve(defaultWorkspaceDir, resolved);
-          } else {
-            resolved = path.resolve(resolved);
+          let rawPath = subArgs.join(" ").trim();
+
+          // Expand ~ to home directory (shell doesn't do this for bot input)
+          if (rawPath === "~") {
+            rawPath = os.homedir();
+          } else if (rawPath.startsWith("~/")) {
+            rawPath = path.join(os.homedir(), rawPath.slice(2));
           }
-          targetPath = resolved;
+
+          // Only accept absolute paths to avoid ambiguity
+          if (!path.isAbsolute(rawPath)) {
+            await platform.reply(msg.replyCtx, "⚠️ *Path must be absolute* (starting with `/`).\n\n*Example:* `/project create /home/admin/my-project`");
+            return true;
+          }
+          const targetPath = path.resolve(rawPath);
 
           // Use the directory basename as the workspace name
           const name = path.basename(targetPath);

@@ -83,15 +83,23 @@ That's it! Send a message to your bot on Telegram and it will be routed to your 
 
 | Command | Description |
 |---------|-------------|
-| `/help` | Show available commands |
+| `/help`, `/start` | Show available commands |
 | `/status` | Check system status and uptime |
-| `/model` | Display agent/CLI information |
+| `/model` | Select AI model |
 | `/stop` | Terminate the currently running task |
 | `/new [name]` | Start a new conversation session |
 | `/list` | List all conversation sessions |
 | `/switch <id>` | Switch to a different session |
 | `/delete <id>` | Delete a conversation session |
-| `/version` | Show version information |
+| `/project`, `/projects` | Manage workspaces / projects |
+| `/version` | Show version and agent/CLI information |
+
+### Workspaces / Projects Subcommands
+
+- `/project` or `/project list` — List all workspaces
+- `/project create <path>` — Create and activate a workspace at `<path>`
+- `/project switch <name>` — Switch to a workspace by name or ID
+- `/project delete <name>` — Delete a workspace by name or ID
 
 ## 🔧 Deploy as Service (systemd)
 
