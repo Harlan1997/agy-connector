@@ -71,6 +71,7 @@ class AgyAgentSession extends Agent {
    */
   async run(sessionKey, prompt, options = {}) {
     const timeoutMinutes = parseInt(options.timeout || "5", 10);
+    const noTimeout = timeoutMinutes <= 0;
 
     // Check for duplicate session — engine should have queued, this is a safety fallback
     if (this._activeProcesses.has(sessionKey) || this._pendingSessions.has(sessionKey)) {
@@ -94,9 +95,26 @@ class AgyAgentSession extends Agent {
       const logFilePath = `/tmp/agy_${sessionKey}.log`;
       try { fs.unlinkSync(logFilePath); } catch (e) {}
 
+      // Build effective prompt: for resumed conversations, prepend a
+      // non-interactive-mode note so the model doesn't stall waiting for
+      // responses that will never arrive (--print is one-shot).
+      let effectivePrompt = prompt;
+      if (options.conversationId) {
+        effectivePrompt =
+          "[IMPORTANT — non-interactive session: You must NOT output " +
+          "passive text like \"I will wait for...\" as your final answer. " +
+          "If a previous tool (compile, simulation, build, subagent) seems " +
+          "incomplete, use run_command or view_file to check its actual " +
+          "result or output file directly. Do not assume it's still running. " +
+          "Always end with a concrete result, summary, or next action.]\n\n" +
+          prompt;
+      }
+
+      // --print-timeout: use configured value, or 24h when unlimited (0)
+      const printTimeout = noTimeout ? "1440m" : `${timeoutMinutes}m`;
       const args = [
-        "--print", prompt,
-        "--print-timeout", `${timeoutMinutes}m`,
+        "--print", effectivePrompt,
+        "--print-timeout", printTimeout,
         "--log-file", logFilePath,
       ];
 
@@ -515,14 +533,16 @@ class AgyAgentSession extends Agent {
         });
       });
 
-      // Hard timeout
-      const hardMs = Math.max(timeoutMinutes * 2, 5) * 60 * 1000;
-      const hardTimer = setTimeout(() => {
-        log.warn(`hard timeout reached for session ${sessionKey}, terminating...`);
-        try { proc.kill(); } catch {}
-      }, hardMs);
-
-      proc.onExit(() => clearTimeout(hardTimer));
+      // Hard timeout (skipped when timeout is 0 = unlimited)
+      let hardTimer = null;
+      if (!noTimeout) {
+        const hardMs = Math.max(timeoutMinutes * 2, 5) * 60 * 1000;
+        hardTimer = setTimeout(() => {
+          log.warn(`hard timeout reached for session ${sessionKey}, terminating...`);
+          try { proc.kill(); } catch {}
+        }, hardMs);
+        proc.onExit(() => clearTimeout(hardTimer));
+      }
     });
   }
 

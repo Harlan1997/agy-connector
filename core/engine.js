@@ -300,6 +300,41 @@ class Engine {
       if (previewTimer) clearInterval(previewTimer);
       previewTimer = null;
 
+      // Build final output — apply dead-end detection BEFORE preview so
+      // the corrected output appears in both the preview and the reply.
+      let output = result.finalResponse || result.stdout || "(empty response)";
+
+      if (result.ok) {
+        const lazyPatterns = [
+          /\bI will wait\b/i,
+          /\bI.ll wait\b/i,
+          /\bNO_TOOL_CALLS_DUE_TO_WAITING\b/i,
+          /\btimed out waiting\b/i,
+        ];
+        if (
+          session.conversationId &&
+          (output.length < 200 || lazyPatterns.some(p => p.test(output)))
+        ) {
+          const isTimeout = /\btimed out\b/i.test(output);
+          log.info(`dead-end response detected (timeout=${isTimeout} len=${output.length})`);
+
+          // Keep only the activity log, drop the lazy model output.
+          // output will be shown after the preview separator.
+          if (currentOutput && currentOutput.includes("📋 *Activity Log:*")) {
+            let note = isTimeout
+              ? "\n\n⏱️ *Timed out.* The model didn't respond in time. You can send a follow-up message to retry or ask for a summary."
+              : "\n\n🔄 *Work in progress.* The operation may still be running. Send another message to continue or check status.";
+            output = note.trim();
+          } else {
+            output = isTimeout
+              ? "⏱️ *Timed out.* The model didn't respond in time. Try again or send a more specific request."
+              : "🔄 *Task in progress.* Send another message to continue or check status.";
+          }
+        }
+      }
+
+      output = filterPlanningStatements(output);
+
       // Track whether the final response was already shown in the preview
       let responseSentViaPreview = false;
 
@@ -308,27 +343,15 @@ class Engine {
         try {
           let finalPreview = "";
           if (currentOutput && currentOutput.startsWith("📋 *Activity Log:*")) {
-            // Strip the "Drafting Response" section from activity log,
-            // then append the final PTY output as the definitive response.
             let cleanedLog = currentOutput;
             const draftMarker = "\n✍️ *Drafting Response...*";
             const draftIdx = cleanedLog.indexOf(draftMarker);
             if (draftIdx !== -1) {
               cleanedLog = cleanedLog.slice(0, draftIdx).trimEnd();
             }
-
-            if (result.ok) {
-              let output = result.finalResponse || result.stdout || "(empty response)";
-              output = filterPlanningStatements(output);
-              finalPreview = `✅ *Task Finished!*\n🤖 *Model:* ${currentModel}\n\n${cleanedLog}\n\n---\n\n${output}`;
-              session.addHistory("assistant", output);
-              responseSentViaPreview = true;
-            } else {
-              finalPreview = `✅ *Task Finished!*\n🤖 *Model:* ${currentModel}\n⏳ *Status:* Done\n\n${cleanedLog}`;
-            }
+            finalPreview = `✅ *Task Finished!*\n🤖 *Model:* ${currentModel}\n\n${cleanedLog}\n\n---\n\n${output}`;
+            responseSentViaPreview = true;
           } else {
-            // No activity log — just show status. Response will be sent as
-            // a separate reply below.
             finalPreview = `✅ *Task Finished!*\n🤖 *Model:* ${currentModel}\n⏳ *Status:* Done`;
           }
           await this.platform.editMessage(previewHandle, finalPreview);
@@ -336,16 +359,12 @@ class Engine {
       }
 
       if (result.ok) {
-        let output = result.finalResponse || result.stdout || "(empty response)";
-        // Filter out "I will" planning statements
-        output = filterPlanningStatements(output);
-
         // Only send a separate reply if the response wasn't already
         // included in the preview message (avoids duplicate output).
         if (!responseSentViaPreview) {
           await platform.reply(msg.replyCtx, output);
-          session.addHistory("assistant", output);
         }
+        session.addHistory("assistant", output);
 
         // Emit message.sent hook
         this.hooks.emit({
