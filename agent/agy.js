@@ -470,7 +470,7 @@ class AgyAgentSession extends Agent {
         } catch (e) {
           // ignore read errors
         }
-      }, 1000);
+      }, 300);
 
       // Receive streaming data from pty
       proc.onData((data) => {

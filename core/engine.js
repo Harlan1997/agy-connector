@@ -268,7 +268,7 @@ class Engine {
           await platform.editMessage(previewHandle, preview).catch(() => {});
           lastPreviewText = preview;
         }
-      }, 2000);
+      }, 600);
     }
 
     try {
