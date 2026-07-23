@@ -315,20 +315,34 @@ class Engine {
           session.conversationId &&
           lazyPatterns.some(p => p.test(output))
         ) {
-          const isTimeout = /\btimed out\b/i.test(output);
-          log.info(`dead-end response detected (timeout=${isTimeout} len=${output.length})`);
+          log.info(`lazy waiting response detected, triggering automatic follow-up run...`);
+          try {
+            const followResult = await this.agent.run(sessionKey, "[System Auto-Followup] Check if the previous operation or task has completed, inspect log/files, and provide the final result.", {
+              timeout: this.config.agent.timeout,
+              workspaceDir: activeProject.path,
+              conversationId: session.conversationId || "",
+              onData: (fullStdout) => { currentOutput = fullStdout; },
+              onStatus: (status) => { currentStatus = status; },
+            });
+            if (followResult.ok && (followResult.finalResponse || followResult.stdout)) {
+              output = followResult.finalResponse || followResult.stdout;
+            }
+          } catch (err) {
+            log.warn(`auto-followup failed: ${err.message}`);
+          }
 
-          // Keep only the activity log, drop the lazy model output.
-          // output will be shown after the preview separator.
-          if (currentOutput && currentOutput.includes("📋 *Activity Log:*")) {
-            let note = isTimeout
-              ? "\n\n⏱️ *Timed out.* The model didn't respond in time. You can send a follow-up message to retry or ask for a summary."
-              : "\n\n🔄 *Work in progress.* The operation may still be running. Send another message to continue or check status.";
-            output = note.trim();
-          } else {
-            output = isTimeout
-              ? "⏱️ *Timed out.* The model didn't respond in time. Try again or send a more specific request."
-              : "🔄 *Task in progress.* Send another message to continue or check status.";
+          if (lazyPatterns.some(p => p.test(output))) {
+            const isTimeout = /\btimed out\b/i.test(output);
+            if (currentOutput && currentOutput.includes("📋 *Activity Log:*")) {
+              let note = isTimeout
+                ? "\n\n⏱️ *Timed out.* The model didn't respond in time. You can send a follow-up message to retry or ask for a summary."
+                : "\n\n🔄 *Work in progress.* The operation may still be running. Send another message to continue or check status.";
+              output = note.trim();
+            } else {
+              output = isTimeout
+                ? "⏱️ *Timed out.* The model didn't respond in time. Try again or send a more specific request."
+                : "🔄 *Task in progress.* Send another message to continue or check status.";
+            }
           }
         }
       }
