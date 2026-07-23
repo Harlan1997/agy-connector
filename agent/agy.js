@@ -122,6 +122,11 @@ class AgyAgentSession extends Agent {
         "--log-file", logFilePath,
       ];
 
+      // Auto-approve tool permissions if AGY_SKIP_PERMISSIONS is not false (default: true)
+      if (process.env.AGY_SKIP_PERMISSIONS !== "false") {
+        args.unshift("--dangerously-skip-permissions");
+      }
+
       // Resume an existing agy conversation for context continuity
       if (options.conversationId) {
         args.unshift("--conversation", options.conversationId);
