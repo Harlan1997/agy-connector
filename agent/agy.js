@@ -1,8 +1,12 @@
 "use strict";
 
-const fs = require("fs");
-const path = require("path");
-const pty = require("node-pty");
+const child_process = require("child_process");
+let pty = null;
+try {
+  pty = require("node-pty");
+} catch (e) {
+  // node-pty optional, fall back to child_process.spawn
+}
 const { Agent } = require("../core/interfaces");
 const { createLogger } = require("../core/logger");
 
@@ -137,20 +141,48 @@ class AgyAgentSession extends Agent {
 
       let proc;
       try {
-        proc = pty.spawn(this.agyPath, args, {
-          name: "xterm-color",
-          cols: 200,
-          rows: 50,
-          cwd: workspaceDir,
-          env: childEnv,
-        });
+        if (pty) {
+          proc = pty.spawn(this.agyPath, args, {
+            name: "xterm-color",
+            cols: 200,
+            rows: 50,
+            cwd: workspaceDir,
+            env: childEnv,
+          });
+        } else {
+          const cp = child_process.spawn(this.agyPath, args, {
+            cwd: workspaceDir,
+            env: childEnv,
+          });
+          const listeners = { data: [], exit: [] };
+          proc = {
+            pid: cp.pid,
+            onData: (fn) => { listeners.data.push(fn); },
+            onExit: (fn) => { listeners.exit.push(fn); },
+            write: (data) => { try { cp.stdin.write(data); } catch {} },
+            kill: (sig) => { try { cp.kill(sig); } catch {} }
+          };
+          cp.stdout.on("data", (data) => {
+            listeners.data.forEach(fn => fn(data.toString("utf8")));
+          });
+          cp.stderr.on("data", (data) => {
+            listeners.data.forEach(fn => fn(data.toString("utf8")));
+          });
+          cp.on("exit", (exitCode) => {
+            listeners.exit.forEach(fn => fn({ exitCode: exitCode ?? 0 }));
+          });
+          cp.on("error", (err) => {
+            log.error(`child_process error: ${err.message}`);
+            listeners.exit.forEach(fn => fn({ exitCode: -1 }));
+          });
+        }
       } catch (err) {
         this._pendingSessions.delete(sessionKey);
         resolve({
           ok: false,
           exitCode: -1,
           stdout: "",
-          stderr: `failed to spawn pty: ${err.message}`,
+          stderr: `failed to spawn agy process: ${err.message}`,
           durationMs: Date.now() - startTime,
         });
         return;

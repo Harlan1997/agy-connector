@@ -1,0 +1,16 @@
+[Unit]
+Description=AGY Bot - Telegram Bot Bridge for Antigravity AI Agent
+After=network.target
+
+[Service]
+Type=simple
+User=admin
+WorkingDirectory=/home/admin/agy-connector
+ExecStart=/usr/bin/node bridge.js
+Restart=always
+RestartSec=5
+Environment=NODE_ENV=production
+Environment=PATH=/home/admin/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=multi-user.target
