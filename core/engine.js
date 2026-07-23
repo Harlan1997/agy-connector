@@ -313,7 +313,7 @@ class Engine {
         ];
         if (
           session.conversationId &&
-          (output.length < 200 || lazyPatterns.some(p => p.test(output)))
+          lazyPatterns.some(p => p.test(output))
         ) {
           const isTimeout = /\btimed out\b/i.test(output);
           log.info(`dead-end response detected (timeout=${isTimeout} len=${output.length})`);
